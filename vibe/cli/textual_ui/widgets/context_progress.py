@@ -11,6 +11,7 @@ from textual.widgets import Static
 class TokenState:
     max_tokens: int = 0
     current_tokens: int = 0
+    soft_limit_ratio: float = 1.0
 
 
 class ContextProgress(Static):
@@ -27,5 +28,22 @@ class ContextProgress(Static):
         percentage = min(
             100, int((new_state.current_tokens / new_state.max_tokens) * 100)
         )
-        text = f"{percentage}% of {new_state.max_tokens // 1000}k tokens"
+        bar_width = 20
+        filled = min(bar_width, round(bar_width * (percentage / 100)))
+        soft_ratio = max(0.0, min(new_state.soft_limit_ratio, 1.0))
+        soft_cutoff = min(bar_width, max(0, round(bar_width * soft_ratio)))
+
+        bar_chars = []
+        for idx in range(bar_width):
+            if idx < filled:
+                bar_chars.append("█" if idx < soft_cutoff else "▓")
+            else:
+                bar_chars.append("░")
+
+        soft_limit = int(new_state.max_tokens * soft_ratio)
+        text = (
+            f"[{''.join(bar_chars)}] "
+            f"{new_state.current_tokens:,}/{new_state.max_tokens:,} tokens "
+            f"(memory @ {soft_limit:,})"
+        )
         self.update(text)

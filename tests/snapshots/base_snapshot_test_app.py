@@ -46,6 +46,10 @@ class BaseSnapshotTestApp(VibeApp):
         await super().on_mount()
         self._hide_chat_input_cursor()
 
+    async def _load_plan_state(self) -> None:  # type: ignore[override]
+        """Prevent snapshot tests from touching the real planner persistence."""
+        return
+
     def _hide_chat_input_cursor(self) -> None:
         text_area = self.query_one(ChatTextArea)
         hidden_cursor_theme = TextAreaTheme(name="hidden_cursor", cursor_style=Style())

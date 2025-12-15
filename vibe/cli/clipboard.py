@@ -27,7 +27,7 @@ def _shorten_preview(texts: list[str]) -> str:
     return dense_text
 
 
-def copy_selection_to_clipboard(app: App) -> None:
+def copy_selection_to_clipboard(app: App) -> bool:
     selected_texts = []
 
     for widget in app.query("*"):
@@ -49,25 +49,26 @@ def copy_selection_to_clipboard(app: App) -> None:
             selected_texts.append(selected_text)
 
     if not selected_texts:
-        return
+        return False
 
     combined_text = "\n".join(selected_texts)
 
     for copy_fn in [_copy_osc52, pyperclip.copy, app.copy_to_clipboard]:
         try:
             copy_fn(combined_text)
-        except:
-            pass
+        except Exception:
+            continue
         else:
             app.notify(
                 f'"{_shorten_preview(selected_texts)}" copied to clipboard',
                 severity="information",
                 timeout=2,
             )
-            break
+            return True
     else:
         app.notify(
             "Failed to copy - no clipboard method available",
             severity="warning",
             timeout=3,
         )
+        return False

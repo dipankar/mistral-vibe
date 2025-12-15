@@ -248,12 +248,47 @@ class ToolResultEvent(BaseEvent):
 class CompactStartEvent(BaseEvent):
     current_context_tokens: int
     threshold: int
+    preemptive: bool = False
 
 
 class CompactEndEvent(BaseEvent):
     old_context_tokens: int
     new_context_tokens: int
     summary_length: int
+    preemptive: bool = False
+
+
+class PlanEvent(BaseEvent):
+    plan_id: str
+
+
+class PlanStartedEvent(PlanEvent):
+    goal: str
+    summary: str
+    steps: list[str]
+
+
+class PlanStepUpdateEvent(PlanEvent):
+    step_id: str
+    title: str
+    status: str
+    notes: str | None = None
+    mode: str | None = None
+
+
+class PlanDecisionEvent(PlanEvent):
+    decision_id: str
+    question: str
+    options: list[str] = Field(default_factory=list)
+    resolved: bool = False
+    selection: str | None = None
+
+
+class MemoryEntryEvent(BaseEvent):
+    entry_index: int
+    summary: str
+    token_count: int = 0
+    task_hints: list[str] = Field(default_factory=list)
 
 
 class OutputFormat(StrEnum):

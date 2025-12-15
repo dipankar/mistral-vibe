@@ -16,6 +16,7 @@ class MiddlewareAction(StrEnum):
     STOP = auto()
     COMPACT = auto()
     INJECT_MESSAGE = auto()
+    MEMORY_COMPACT = auto()
 
 
 class ResetReason(StrEnum):
@@ -85,8 +86,9 @@ class PriceLimitMiddleware:
 
 
 class AutoCompactMiddleware:
-    def __init__(self, threshold: int) -> None:
+    def __init__(self, threshold: int, preempt_ratio: float = 0.95) -> None:
         self.threshold = threshold
+        self.preempt_ratio = max(0.0, min(preempt_ratio, 1.0))
 
     async def before_turn(self, context: ConversationContext) -> MiddlewareResult:
         if context.stats.context_tokens >= self.threshold:
@@ -95,6 +97,17 @@ class AutoCompactMiddleware:
                 metadata={
                     "old_tokens": context.stats.context_tokens,
                     "threshold": self.threshold,
+                },
+            )
+
+        soft_threshold = int(self.threshold * self.preempt_ratio)
+        if soft_threshold > 0 and context.stats.context_tokens >= soft_threshold:
+            return MiddlewareResult(
+                action=MiddlewareAction.MEMORY_COMPACT,
+                metadata={
+                    "old_tokens": context.stats.context_tokens,
+                    "threshold": self.threshold,
+                    "soft_threshold": soft_threshold,
                 },
             )
         return MiddlewareResult()
@@ -163,7 +176,11 @@ class MiddlewarePipeline:
             result = await mw.before_turn(context)
             if result.action == MiddlewareAction.INJECT_MESSAGE and result.message:
                 messages_to_inject.append(result.message)
-            elif result.action in {MiddlewareAction.STOP, MiddlewareAction.COMPACT}:
+            elif result.action in {
+                MiddlewareAction.STOP,
+                MiddlewareAction.COMPACT,
+                MiddlewareAction.MEMORY_COMPACT,
+            }:
                 return result
         if messages_to_inject:
             combined_message = "\n\n".join(messages_to_inject)
@@ -180,7 +197,11 @@ class MiddlewarePipeline:
             result = await mw.after_turn(context)
             if result.action == MiddlewareAction.INJECT_MESSAGE and result.message:
                 messages_to_inject.append(result.message)
-            elif result.action in {MiddlewareAction.STOP, MiddlewareAction.COMPACT}:
+            elif result.action in {
+                MiddlewareAction.STOP,
+                MiddlewareAction.COMPACT,
+                MiddlewareAction.MEMORY_COMPACT,
+            }:
                 return result
         if messages_to_inject:
             combined_message = "\n\n".join(messages_to_inject)

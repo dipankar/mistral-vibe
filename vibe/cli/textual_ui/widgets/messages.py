@@ -5,6 +5,12 @@ from textual.containers import Horizontal, Vertical
 from textual.widgets import Markdown, Static
 from textual.widgets._markdown import MarkdownStream
 
+from vibe.core.types import (
+    MemoryEntryEvent,
+    PlanDecisionEvent,
+    PlanStartedEvent,
+    PlanStepUpdateEvent,
+)
 
 class UserMessage(Static):
     def __init__(self, content: str, pending: bool = False) -> None:
@@ -146,3 +152,64 @@ class ErrorMessage(Static):
             self.mount(Static("Error. (ctrl+o to expand)", markup=False))
         else:
             self.mount(Static(f"Error: {self._error}", markup=False))
+
+
+class PlanStartedMessage(Static):
+    def __init__(self, event: PlanStartedEvent) -> None:
+        super().__init__()
+        self.add_class("plan-message")
+        self._event = event
+
+    def compose(self) -> ComposeResult:
+        steps_md = "\n".join(f"- {step}" for step in self._event.steps)
+        summary = (
+            f"### Plan started: {self._event.goal}\n\n"
+            f"{self._event.summary}\n\n"
+            f"#### Steps\n{steps_md}"
+        )
+        yield Markdown(summary)
+
+
+class PlanStepUpdateMessage(Static):
+    def __init__(self, event: PlanStepUpdateEvent) -> None:
+        super().__init__()
+        self.add_class("plan-message")
+        self.add_class("plan-step-update")
+        self._event = event
+
+    def compose(self) -> ComposeResult:
+        notes = f"\n\n{self._event.notes}" if self._event.notes else ""
+        mode = f"\nMode: `{self._event.mode}`" if self._event.mode else ""
+        body = (
+            f"**Step {self._event.step_id}** · {self._event.title}\n\n"
+            f"Status: `{self._event.status}`{mode}{notes}"
+        )
+        yield Markdown(body)
+
+
+class PlanDecisionMessage(Static):
+    def __init__(self, event: PlanDecisionEvent) -> None:
+        super().__init__()
+        self.add_class("plan-message")
+        self.add_class("plan-decision-update")
+        self._event = event
+
+    def compose(self) -> ComposeResult:
+        options = (
+            "\n".join(f"- `{option}`" for option in self._event.options)
+            if self._event.options
+            else "Freeform response"
+        )
+        status_line = (
+            f"Selection: `{self._event.selection}`"
+            if self._event.resolved and self._event.selection
+            else "Awaiting selection"
+        )
+        body = (
+            f"**Decision {self._event.decision_id}**\n\n"
+            f"{self._event.question}\n\n"
+            f"Options:\n{options}\n\n"
+            f"{status_line}\n\n"
+            "Respond with `/plan decide <id> <choice>` when ready."
+        )
+        yield Markdown(body)

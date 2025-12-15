@@ -515,6 +515,12 @@ class TestAutoCompactIntegration:
         )
         agent = Agent(cfg, message_observer=observer, backend=backend)
         agent.stats.context_tokens = 2
+        agent.messages.extend(
+            [
+                LLMMessage(role=Role.user, content="Earlier task"),
+                LLMMessage(role=Role.assistant, content="Resolved"),
+            ]
+        )
 
         events = [ev async for ev in agent.act("Hello")]
 
@@ -529,16 +535,19 @@ class TestAutoCompactIntegration:
 
         assert start.current_context_tokens == 2
         assert start.threshold == 1
+        assert start.preemptive is False
         assert end.old_context_tokens == 2
         assert end.new_context_tokens >= 1
+        assert end.preemptive is False
         assert final.content == "<final>"
 
         roles = [r for r, _ in observed]
         assert roles == [Role.system, Role.user, Role.assistant]
         assert (
             observed[1][1] is not None
-            and "Last request from user was: Hello" in observed[1][1]
+            and "[Memory #1]" in observed[1][1]
         )
+        assert "- Hello" in (observed[1][1] or "")
 
 
 class TestClearHistoryFullReset:

@@ -15,6 +15,7 @@ from vibe.core.interaction_logger import InteractionLogger
 from vibe.core.llm.backend.factory import BACKEND_FACTORY
 from vibe.core.llm.format import APIToolFormatHandler, ResolvedMessage
 from vibe.core.llm.types import BackendLike
+from vibe.core.memory import MemoryEntry, SessionMemory
 from vibe.core.middleware import (
     AutoCompactMiddleware,
     ContextWarningMiddleware,
@@ -46,6 +47,7 @@ from vibe.core.types import (
     CompactStartEvent,
     LLMChunk,
     LLMMessage,
+    MemoryEntryEvent,
     Role,
     SyncApprovalCallback,
     ToolCall,
@@ -112,6 +114,8 @@ class Agent:
         system_prompt = get_universal_system_prompt(self.tool_manager, config)
 
         self.messages = [LLMMessage(role=Role.system, content=system_prompt)]
+        self.session_memory = SessionMemory()
+        self._memory_synced = False
 
         if self.message_observer:
             self.message_observer(self.messages[0])
@@ -148,6 +152,12 @@ class Agent:
     def add_message(self, message: LLMMessage) -> None:
         self.messages.append(message)
 
+    def _ensure_memory_initialized(self) -> None:
+        if self._memory_synced:
+            return
+        self.session_memory.sync_from_messages(self.messages)
+        self._memory_synced = True
+
     def _flush_new_messages(self) -> None:
         if not self.message_observer:
             return
@@ -160,6 +170,7 @@ class Agent:
         self._last_observed_message_index = len(self.messages)
 
     async def act(self, msg: str) -> AsyncGenerator[BaseEvent]:
+        self._ensure_memory_initialized()
         self._clean_message_history()
         async for event in self._conversation_loop(msg):
             yield event
@@ -175,11 +186,17 @@ class Agent:
 
         if self.config.auto_compact_threshold > 0:
             self.middleware_pipeline.add(
-                AutoCompactMiddleware(self.config.auto_compact_threshold)
+                AutoCompactMiddleware(
+                    self.config.auto_compact_threshold,
+                    self.config.memory_soft_limit_ratio,
+                )
             )
             if self.config.context_warnings:
                 self.middleware_pipeline.add(
-                    ContextWarningMiddleware(0.5, self.config.auto_compact_threshold)
+                    ContextWarningMiddleware(
+                        self.config.memory_soft_limit_ratio,
+                        self.config.auto_compact_threshold,
+                    )
                 )
 
     async def _handle_middleware_result(
@@ -204,6 +221,8 @@ class Agent:
                         last_msg.content = result.message
 
             case MiddlewareAction.COMPACT:
+                if not self._has_compressible_history(force_full=True):
+                    return
                 old_tokens = result.metadata.get(
                     "old_tokens", self.stats.context_tokens
                 )
@@ -215,13 +234,56 @@ class Agent:
                     current_context_tokens=old_tokens, threshold=threshold
                 )
 
-                summary = await self.compact()
+                summary, entry = await self._compress_history_into_memory(
+                    force_full=True
+                )
+                summary_text = summary or ""
 
                 yield CompactEndEvent(
                     old_context_tokens=old_tokens,
                     new_context_tokens=self.stats.context_tokens,
-                    summary_length=len(summary),
+                    summary_length=len(summary_text),
                 )
+                if entry:
+                    yield MemoryEntryEvent(
+                        entry_index=len(self.session_memory.entries),
+                        summary=entry.summary,
+                        token_count=entry.token_count,
+                        task_hints=list(entry.task_hints),
+                    )
+
+            case MiddlewareAction.MEMORY_COMPACT:
+                if not self._has_compressible_history():
+                    return
+                old_tokens = result.metadata.get(
+                    "old_tokens", self.stats.context_tokens
+                )
+                threshold = result.metadata.get(
+                    "threshold", self.config.auto_compact_threshold
+                )
+
+                yield CompactStartEvent(
+                    current_context_tokens=old_tokens,
+                    threshold=threshold,
+                    preemptive=True,
+                )
+
+                summary, entry = await self._compress_history_into_memory()
+                summary_text = summary or ""
+
+                yield CompactEndEvent(
+                    old_context_tokens=old_tokens,
+                    new_context_tokens=self.stats.context_tokens,
+                    summary_length=len(summary_text),
+                    preemptive=True,
+                )
+                if entry:
+                    yield MemoryEntryEvent(
+                        entry_index=len(self.session_memory.entries),
+                        summary=entry.summary,
+                        token_count=entry.token_count,
+                        task_hints=list(entry.task_hints),
+                    )
 
             case MiddlewareAction.CONTINUE:
                 pass
@@ -764,6 +826,122 @@ class Agent:
         self._fill_missing_tool_responses()
         self._ensure_assistant_after_tools()
 
+    def _conversation_without_memory(self) -> list[LLMMessage]:
+        return [
+            msg
+            for msg in self.messages[1:]
+            if not SessionMemory.is_memory_message(msg)
+        ]
+
+    def _split_history_for_memory(
+        self, *, force_full: bool = False
+    ) -> tuple[list[LLMMessage], list[LLMMessage]]:
+        conversation = self._conversation_without_memory()
+        min_recent = 0 if force_full else 4
+        if len(conversation) <= min_recent:
+            return [], conversation
+
+        cutoff = len(conversation) - min_recent
+        return conversation[:cutoff], conversation[cutoff:]
+
+    def _has_compressible_history(self, *, force_full: bool = False) -> bool:
+        memory_candidates, _ = self._split_history_for_memory(
+            force_full=force_full
+        )
+        return bool(memory_candidates)
+
+    async def _compress_history_into_memory(
+        self, force_full: bool = False
+    ) -> tuple[str | None, MemoryEntry | None]:
+        try:
+            self._ensure_memory_initialized()
+            self._clean_message_history()
+            await self.interaction_logger.save_interaction(
+                self.messages, self.stats, self.config, self.tool_manager
+            )
+
+            memory_candidates, recent_messages = self._split_history_for_memory(
+                force_full=force_full
+            )
+            if not memory_candidates:
+                return None, None
+
+            summary = await self._summarize_messages(memory_candidates)
+            if not summary.strip():
+                return None, None
+
+            last_request = next(
+                (
+                    msg.content or ""
+                    for msg in reversed(memory_candidates)
+                    if msg.role is Role.user and (msg.content or "").strip()
+                ),
+                None,
+            )
+            hints = [last_request] if last_request else []
+            token_snapshot = self.stats.context_tokens
+            entry = self.session_memory.add_entry(
+                summary, task_hints=hints, token_count=token_snapshot
+            )
+
+            self._rebuild_messages_with_memory(recent_messages)
+            await self._refresh_context_tokens()
+
+            self._reset_session()
+            await self.interaction_logger.save_interaction(
+                self.messages, self.stats, self.config, self.tool_manager
+            )
+            self.middleware_pipeline.reset(reset_reason=ResetReason.COMPACT)
+            return summary, entry
+
+        except Exception:
+            await self.interaction_logger.save_interaction(
+                self.messages, self.stats, self.config, self.tool_manager
+            )
+            raise
+
+    async def _summarize_messages(self, targets: list[LLMMessage]) -> str:
+        summary_request = UtilityPrompt.COMPACT.read()
+        preserved_messages = self.messages
+        system_prompt = preserved_messages[0].content if preserved_messages else ""
+        self.messages = [LLMMessage(role=Role.system, content=system_prompt or "")]
+        self.messages.extend(targets)
+        self.messages.append(LLMMessage(role=Role.user, content=summary_request))
+        self.stats.steps += 1
+
+        try:
+            summary_result = await self._chat()
+            if summary_result.usage is None:
+                raise LLMResponseError(
+                    "Usage data missing in compaction summary response"
+                )
+            return summary_result.message.content or ""
+        finally:
+            self.messages = preserved_messages
+
+    def _rebuild_messages_with_memory(self, recent_messages: list[LLMMessage]) -> None:
+        system_message = self.messages[0]
+        filtered_recent = [
+            msg for msg in recent_messages if not SessionMemory.is_memory_message(msg)
+        ]
+        rebuilt = [system_message, *self.session_memory.as_messages(), *filtered_recent]
+        self.messages = rebuilt
+        self._memory_synced = True
+
+    async def _refresh_context_tokens(self) -> None:
+        active_model = self.config.get_active_model()
+        provider = self.config.get_provider_for_model(active_model)
+        async with self.backend as backend:
+            actual_context_tokens = await backend.count_tokens(
+                model=active_model,
+                messages=self.messages,
+                tools=self.format_handler.get_available_tools(
+                    self.tool_manager, self.config
+                ),
+                extra_headers={"user-agent": get_user_agent(provider.backend)},
+            )
+        self.stats.context_tokens = actual_context_tokens
+
     def _fill_missing_tool_responses(self) -> None:
         i = 1
         while i < len(self.messages):  # noqa: PLR1702
@@ -828,6 +1006,8 @@ class Agent:
             self.messages, self.stats, self.config, self.tool_manager
         )
         self.messages = self.messages[:1]
+        self.session_memory.clear()
+        self._memory_synced = False
 
         self.stats = AgentStats()
 
@@ -844,67 +1024,8 @@ class Agent:
         self._reset_session()
 
     async def compact(self) -> str:
-        try:
-            self._clean_message_history()
-            await self.interaction_logger.save_interaction(
-                self.messages, self.stats, self.config, self.tool_manager
-            )
-
-            last_user_message = None
-            for msg in reversed(self.messages):
-                if msg.role == Role.user:
-                    last_user_message = msg.content
-                    break
-
-            summary_request = UtilityPrompt.COMPACT.read()
-            self.messages.append(LLMMessage(role=Role.user, content=summary_request))
-            self.stats.steps += 1
-
-            summary_result = await self._chat()
-            if summary_result.usage is None:
-                raise LLMResponseError(
-                    "Usage data missing in compaction summary response"
-                )
-            summary_content = summary_result.message.content or ""
-
-            if last_user_message:
-                summary_content += (
-                    f"\n\nLast request from user was: {last_user_message}"
-                )
-
-            system_message = self.messages[0]
-            summary_message = LLMMessage(role=Role.user, content=summary_content)
-            self.messages = [system_message, summary_message]
-
-            active_model = self.config.get_active_model()
-            provider = self.config.get_provider_for_model(active_model)
-
-            async with self.backend as backend:
-                actual_context_tokens = await backend.count_tokens(
-                    model=active_model,
-                    messages=self.messages,
-                    tools=self.format_handler.get_available_tools(
-                        self.tool_manager, self.config
-                    ),
-                    extra_headers={"user-agent": get_user_agent(provider.backend)},
-                )
-
-            self.stats.context_tokens = actual_context_tokens
-
-            self._reset_session()
-            await self.interaction_logger.save_interaction(
-                self.messages, self.stats, self.config, self.tool_manager
-            )
-
-            self.middleware_pipeline.reset(reset_reason=ResetReason.COMPACT)
-
-            return summary_content or ""
-
-        except Exception:
-            await self.interaction_logger.save_interaction(
-                self.messages, self.stats, self.config, self.tool_manager
-            )
-            raise
+        summary, _ = await self._compress_history_into_memory(force_full=True)
+        return summary or ""
 
     async def reload_with_initial_messages(
         self,
@@ -931,6 +1052,12 @@ class Agent:
 
         if preserved_messages:
             self.messages.extend(preserved_messages)
+
+        self.session_memory.clear()
+        self._memory_synced = False
+        self._ensure_memory_initialized()
+        if self.session_memory.entries:
+            self._rebuild_messages_with_memory(self._conversation_without_memory())
 
         if len(self.messages) == 1 or did_system_prompt_change:
             self.stats.reset_context_state()

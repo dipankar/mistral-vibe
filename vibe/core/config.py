@@ -283,6 +283,7 @@ class VibeConfig(BaseSettings):
     disable_welcome_banner_animation: bool = False
     displayed_workdir: str = ""
     auto_compact_threshold: int = 200_000
+    memory_soft_limit_ratio: float = 0.95
     context_warnings: bool = False
     textual_theme: str = "textual-dark"
     instructions: str = ""
@@ -456,6 +457,15 @@ class VibeConfig(BaseSettings):
                 normalized[tool_name] = BaseToolConfig()
 
         return normalized
+
+    @field_validator("memory_soft_limit_ratio", mode="before")
+    @classmethod
+    def _clamp_soft_limit_ratio(cls, value: Any) -> float:
+        try:
+            ratio = float(value)
+        except (TypeError, ValueError):
+            return 0.95
+        return min(1.0, max(0.0, ratio))
 
     @model_validator(mode="after")
     def _validate_model_uniqueness(self) -> VibeConfig:

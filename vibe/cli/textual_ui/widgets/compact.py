@@ -4,15 +4,18 @@ from vibe.cli.textual_ui.widgets.blinking_message import BlinkingMessage
 
 
 class CompactMessage(BlinkingMessage):
-    def __init__(self) -> None:
+    def __init__(self, *, preemptive: bool = False) -> None:
         super().__init__()
         self.add_class("compact-message")
         self.old_tokens: int | None = None
         self.new_tokens: int | None = None
         self.error_message: str | None = None
+        self.preemptive = preemptive
 
     def get_content(self) -> str:
         if self._is_blinking:
+            if self.preemptive:
+                return "Storing long-term memory..."
             return "Compacting conversation history..."
 
         if self.error_message:
@@ -23,12 +26,13 @@ class CompactMessage(BlinkingMessage):
             reduction_pct = (
                 (reduction / self.old_tokens * 100) if self.old_tokens > 0 else 0
             )
+            prefix = "Memory stored" if self.preemptive else "Compaction complete"
             return (
-                f"Compaction complete: {self.old_tokens:,} → "
+                f"{prefix}: {self.old_tokens:,} → "
                 f"{self.new_tokens:,} tokens (-{reduction_pct:.1f}%)"
             )
 
-        return "Compaction complete"
+        return "Memory stored" if self.preemptive else "Compaction complete"
 
     def set_complete(
         self, old_tokens: int | None = None, new_tokens: int | None = None

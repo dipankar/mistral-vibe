@@ -75,8 +75,9 @@ def test_copy_selection_to_clipboard_no_notification(
         del widgets[0].text_selection
     mock_app.query.return_value = widgets
 
-    copy_selection_to_clipboard(mock_app)
+    copied = copy_selection_to_clipboard(mock_app)
     mock_app.notify.assert_not_called()
+    assert copied is False
 
 
 @patch("vibe.cli.clipboard._copy_osc52")
@@ -89,7 +90,7 @@ def test_copy_selection_to_clipboard_success_with_osc52(
     )
     mock_app.query.return_value = [widget]
 
-    copy_selection_to_clipboard(mock_app)
+    copied = copy_selection_to_clipboard(mock_app)
 
     mock_osc52_copy.assert_called_once_with("selected text")
     mock_pyperclip_copy.assert_not_called()
@@ -97,6 +98,7 @@ def test_copy_selection_to_clipboard_success_with_osc52(
     mock_app.notify.assert_called_once_with(
         '"selected text" copied to clipboard', severity="information", timeout=2
     )
+    assert copied is True
 
 
 @patch("vibe.cli.clipboard._copy_osc52")
@@ -111,7 +113,7 @@ def test_copy_selection_to_clipboard_osc52_fails_success_with_pyperclip(
     mock_app.query.return_value = [widget]
     mock_osc52_copy.side_effect = Exception("osc52 failed")
 
-    copy_selection_to_clipboard(mock_app)
+    copied = copy_selection_to_clipboard(mock_app)
 
     mock_osc52_copy.assert_called_once_with("   selected text  ")
     mock_pyperclip_copy.assert_called_once_with("   selected text  ")
@@ -119,6 +121,7 @@ def test_copy_selection_to_clipboard_osc52_fails_success_with_pyperclip(
         '"   selected text  " copied to clipboard', severity="information", timeout=2
     )
     mock_app.copy_to_clipboard.assert_not_called()
+    assert copied is True
 
 
 @patch("vibe.cli.clipboard._copy_osc52")
@@ -133,7 +136,7 @@ def test_copy_selection_to_clipboard_osc52_and_pyperclip_fail_success_with_app_c
     mock_osc52_copy.side_effect = Exception("osc52 failed")
     mock_pyperclip_copy.side_effect = Exception("pyperclip failed")
 
-    copy_selection_to_clipboard(mock_app)
+    copied = copy_selection_to_clipboard(mock_app)
 
     mock_osc52_copy.assert_called_once_with("selected text")
     mock_pyperclip_copy.assert_called_once_with("selected text")
@@ -141,6 +144,7 @@ def test_copy_selection_to_clipboard_osc52_and_pyperclip_fail_success_with_app_c
     mock_app.notify.assert_called_once_with(
         '"selected text" copied to clipboard', severity="information", timeout=2
     )
+    assert copied is True
 
 
 @patch("vibe.cli.clipboard._copy_osc52")
@@ -156,7 +160,7 @@ def test_copy_selection_to_clipboard_all_methods_fail(
     mock_pyperclip_copy.side_effect = Exception("pyperclip failed")
     mock_app.copy_to_clipboard.side_effect = Exception("app copy failed")
 
-    copy_selection_to_clipboard(mock_app)
+    copied = copy_selection_to_clipboard(mock_app)
 
     mock_osc52_copy.assert_called_once_with("selected text")
     mock_pyperclip_copy.assert_called_once_with("selected text")
@@ -164,6 +168,7 @@ def test_copy_selection_to_clipboard_all_methods_fail(
     mock_app.notify.assert_called_once_with(
         "Failed to copy - no clipboard method available", severity="warning", timeout=3
     )
+    assert copied is False
 
 
 def test_copy_selection_to_clipboard_multiple_widgets(mock_app: MagicMock) -> None:
@@ -178,7 +183,7 @@ def test_copy_selection_to_clipboard_multiple_widgets(mock_app: MagicMock) -> No
     mock_app.query.return_value = [widget1, widget2, widget3]
 
     with patch("vibe.cli.clipboard._copy_osc52") as mock_osc52_copy:
-        copy_selection_to_clipboard(mock_app)
+        copied = copy_selection_to_clipboard(mock_app)
 
         mock_osc52_copy.assert_called_once_with("first selection\nsecond selection")
         mock_app.notify.assert_called_once_with(
@@ -186,6 +191,7 @@ def test_copy_selection_to_clipboard_multiple_widgets(mock_app: MagicMock) -> No
             severity="information",
             timeout=2,
         )
+        assert copied is True
 
 
 def test_copy_selection_to_clipboard_preview_shortening(mock_app: MagicMock) -> None:
@@ -200,7 +206,7 @@ def test_copy_selection_to_clipboard_preview_shortening(mock_app: MagicMock) -> 
         patch("vibe.cli.clipboard.pyperclip.copy") as mock_pyperclip_copy,
     ):
         mock_osc52_copy.side_effect = Exception("osc52 failed")
-        copy_selection_to_clipboard(mock_app)
+        copied = copy_selection_to_clipboard(mock_app)
 
         mock_osc52_copy.assert_called_once_with(long_text)
         mock_pyperclip_copy.assert_called_once_with(long_text)
@@ -209,6 +215,7 @@ def test_copy_selection_to_clipboard_preview_shortening(mock_app: MagicMock) -> 
         assert '"' in notification_call[0][0]
         assert "copied to clipboard" in notification_call[0][0]
         assert len(notification_call[0][0]) < len(long_text) + 30
+        assert copied is True
 
 
 @patch("builtins.open", new_callable=mock_open)

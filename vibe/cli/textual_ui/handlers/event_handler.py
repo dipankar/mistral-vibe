@@ -6,13 +6,17 @@ from typing import TYPE_CHECKING
 from textual.widgets import Static
 
 from vibe.cli.textual_ui.widgets.compact import CompactMessage
-from vibe.cli.textual_ui.widgets.messages import AssistantMessage
+from vibe.cli.textual_ui.widgets.messages import (
+    AssistantMessage,
+    MemoryUpdateMessage,
+)
 from vibe.cli.textual_ui.widgets.tools import ToolCallMessage, ToolResultMessage
 from vibe.core.types import (
     AssistantEvent,
     BaseEvent,
     CompactEndEvent,
     CompactStartEvent,
+    MemoryEntryEvent,
     ToolCallEvent,
     ToolResultEvent,
 )
@@ -58,10 +62,13 @@ class EventHandler:
                 await self._handle_assistant_message(event)
                 return None
             case CompactStartEvent():
-                await self._handle_compact_start()
+                await self._handle_compact_start(event)
                 return None
             case CompactEndEvent():
                 await self._handle_compact_end(event)
+                return None
+            case MemoryEntryEvent():
+                await self._handle_memory_entry(event)
                 return None
             case _:
                 await self._handle_unknown_event(event)
@@ -127,8 +134,8 @@ class EventHandler:
     async def _handle_assistant_message(self, event: AssistantEvent) -> None:
         await self.mount_callback(AssistantMessage(event.content))
 
-    async def _handle_compact_start(self) -> None:
-        compact_msg = CompactMessage()
+    async def _handle_compact_start(self, event: CompactStartEvent) -> None:
+        compact_msg = CompactMessage(preemptive=event.preemptive)
         self.current_compact = compact_msg
         await self.mount_callback(compact_msg)
 
@@ -138,6 +145,9 @@ class EventHandler:
                 old_tokens=event.old_context_tokens, new_tokens=event.new_context_tokens
             )
             self.current_compact = None
+
+    async def _handle_memory_entry(self, event: MemoryEntryEvent) -> None:
+        await self.mount_callback(MemoryUpdateMessage(event))
 
     async def _handle_unknown_event(self, event: BaseEvent) -> None:
         await self.mount_callback(
