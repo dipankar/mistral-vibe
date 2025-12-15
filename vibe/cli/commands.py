@@ -90,6 +90,12 @@ class CommandRegistry:
                 description="Cancel the active planning session",
                 handler="_cancel_plan",
             ),
+            "plan_auto": Command(
+                aliases=frozenset(["/plan auto", "/plan-auto"]),
+                description="Toggle planner auto-start mode",
+                handler="_toggle_plan_auto",
+                accepts_argument=True,
+            ),
             "plan_decide": Command(
                 aliases=frozenset(["/plan decide", "/plan-decide"]),
                 description="Respond to a planner decision prompt",
@@ -129,6 +135,7 @@ class CommandRegistry:
             "",
             "- `Enter` Submit message",
             "- `Ctrl+J` / `Shift+Enter` Insert newline",
+            "- `Tab` Toggle Thinking Mode (adds a lightweight plan before each reply)",
             "- `Escape` Interrupt agent or close dialogs",
             "- `Ctrl+C` Quit (or clear input if text present)",
             "- `Ctrl+Shift+C` Copy selected text",

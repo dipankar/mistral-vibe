@@ -42,6 +42,9 @@ class ChatTextArea(TextArea):
     class HistoryReset(Message):
         """Message sent when history navigation should be reset."""
 
+    class ThinkingModeToggleRequested(Message):
+        """Request to toggle thinking mode from the input."""
+
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._history_prefix: str | None = None
@@ -141,6 +144,12 @@ class ChatTextArea(TextArea):
 
     async def _on_key(self, event: events.Key) -> None:
         self._mark_cursor_moved_if_needed()
+
+        if event.key == "tab":
+            event.prevent_default()
+            event.stop()
+            self.post_message(self.ThinkingModeToggleRequested())
+            return
 
         manager = self._completion_manager
         if manager:

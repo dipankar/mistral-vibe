@@ -41,9 +41,16 @@ class ContextProgress(Static):
                 bar_chars.append("░")
 
         soft_limit = int(new_state.max_tokens * soft_ratio)
+        status = ""
+        warn_threshold = soft_limit > 0 and new_state.current_tokens >= soft_limit
+        if new_state.current_tokens >= new_state.max_tokens:
+            status = " [bold red](context max reached)[/bold red]"
+        elif warn_threshold:
+            status = " [yellow](preparing memory)[/yellow]"
+
         text = (
             f"[{''.join(bar_chars)}] "
             f"{new_state.current_tokens:,}/{new_state.max_tokens:,} tokens "
-            f"(memory @ {soft_limit:,})"
+            f"(memory @ {soft_limit:,}){status}"
         )
         self.update(text)

@@ -20,6 +20,9 @@ class ChatInputBody(Widget):
             self.value = value
             super().__init__()
 
+    class ThinkingModeToggleRequested(Message):
+        """Bubble thinking mode toggle requests up to the container."""
+
     def __init__(self, history_file: Path | None = None, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.input_widget: ChatTextArea | None = None
@@ -139,6 +142,11 @@ class ChatInputBody(Widget):
 
     def on_text_area_changed(self, event: ChatTextArea.Changed) -> None:
         self._update_prompt()
+
+    def on_chat_text_area_thinking_mode_toggle_requested(
+        self, _: ChatTextArea.ThinkingModeToggleRequested
+    ) -> None:
+        self.post_message(self.ThinkingModeToggleRequested())
 
     def on_chat_text_area_submitted(self, event: ChatTextArea.Submitted) -> None:
         event.stop()

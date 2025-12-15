@@ -235,7 +235,7 @@ class Agent:
                 )
 
                 summary, entry = await self._compress_history_into_memory(
-                    force_full=True
+                    force_full=True, token_snapshot=old_tokens
                 )
                 summary_text = summary or ""
 
@@ -268,7 +268,9 @@ class Agent:
                     preemptive=True,
                 )
 
-                summary, entry = await self._compress_history_into_memory()
+                summary, entry = await self._compress_history_into_memory(
+                    token_snapshot=old_tokens
+                )
                 summary_text = summary or ""
 
                 yield CompactEndEvent(
@@ -851,7 +853,7 @@ class Agent:
         return bool(memory_candidates)
 
     async def _compress_history_into_memory(
-        self, force_full: bool = False
+        self, force_full: bool = False, token_snapshot: int | None = None
     ) -> tuple[str | None, MemoryEntry | None]:
         try:
             self._ensure_memory_initialized()
@@ -879,9 +881,13 @@ class Agent:
                 None,
             )
             hints = [last_request] if last_request else []
-            token_snapshot = self.stats.context_tokens
+            snapshot = (
+                token_snapshot
+                if token_snapshot is not None
+                else self.stats.context_tokens
+            )
             entry = self.session_memory.add_entry(
-                summary, task_hints=hints, token_count=token_snapshot
+                summary, task_hints=hints, token_count=snapshot
             )
 
             self._rebuild_messages_with_memory(recent_messages)
@@ -1024,7 +1030,9 @@ class Agent:
         self._reset_session()
 
     async def compact(self) -> str:
-        summary, _ = await self._compress_history_into_memory(force_full=True)
+        summary, _ = await self._compress_history_into_memory(
+            force_full=True, token_snapshot=self.stats.context_tokens
+        )
         return summary or ""
 
     async def reload_with_initial_messages(

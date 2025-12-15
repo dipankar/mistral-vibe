@@ -11,6 +11,7 @@ from vibe.core.types import (
     CompactEndEvent,
     CompactStartEvent,
     LLMMessage,
+    MemoryEntryEvent,
     Role,
 )
 
@@ -40,19 +41,24 @@ async def test_auto_compact_triggers_and_batches_observer() -> None:
 
     events = [ev async for ev in agent.act("Hello")]
 
-    assert len(events) == 3
+    assert len(events) == 4
     assert isinstance(events[0], CompactStartEvent)
     assert isinstance(events[1], CompactEndEvent)
-    assert isinstance(events[2], AssistantEvent)
+    assert isinstance(events[2], MemoryEntryEvent)
+    assert isinstance(events[3], AssistantEvent)
     start: CompactStartEvent = events[0]
     end: CompactEndEvent = events[1]
-    final: AssistantEvent = events[2]
+    mem_event: MemoryEntryEvent = events[2]
+    final: AssistantEvent = events[3]
     assert start.current_context_tokens == 2
     assert start.threshold == 1
     assert start.preemptive is False
     assert end.old_context_tokens == 2
     assert end.new_context_tokens >= 1
     assert end.preemptive is False
+    assert mem_event.entry_index == 1
+    assert mem_event.summary.strip() == "<summary>"
+    assert mem_event.token_count == 2
     assert final.content == "<final>"
 
     roles = [r for r, _ in observed]
@@ -87,15 +93,18 @@ async def test_preemptive_memory_compaction_before_limit() -> None:
 
     events = [ev async for ev in agent.act("Ping")]
 
-    assert len(events) == 3
+    assert len(events) == 4
     start = events[0]
     end = events[1]
-    final = events[2]
+    mem_event = events[2]
+    final = events[3]
     assert isinstance(start, CompactStartEvent)
     assert isinstance(end, CompactEndEvent)
+    assert isinstance(mem_event, MemoryEntryEvent)
     assert isinstance(final, AssistantEvent)
     assert start.preemptive is True
     assert end.preemptive is True
     assert agent.session_memory.entries
     assert agent.session_memory.entries[0].task_hints == ["Legacy 2"]
+    assert mem_event.entry_index == 1
     assert final.content == "<final>"

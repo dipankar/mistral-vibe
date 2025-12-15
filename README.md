@@ -135,6 +135,14 @@ by default it will use `auto-approve` mode.
 
 Use slash commands for meta-actions and configuration changes during a session.
 
+### Planning & Thinking Modes
+
+- **Thinking Mode (Tab)**: Press `Tab` inside the chat input to toggle a deeper "thinking" pass. Vibe drafts a lightweight plan for each prompt, shows the outline in chat, and injects it into the next LLM call so responses stay structured.
+- **Planner Commands**: Start a scoped plan with `/plan <goal>`, pause/resume/cancel it with `/plan pause`, `/plan resume`, `/plan cancel`, or let Vibe automatically plan every free-form prompt via `/plan auto on`.
+- **Inline Subagents**: Planner steps now render as cards directly in the chat stream. Each card tracks which specialist is running, the current status, and any notes gathered along the way.
+- **Decision Forms**: When the planner needs input, Vibe surfaces a mini form in chat. Pick one of the suggested options or enter a free-form answer—no more memorizing `/plan decide` syntax.
+- **Progress Ticker**: The bottom bar shows an at-a-glance ticker for plan progress, active subagents, memory pressure, thinking-mode state, and rate limit alerts so you always know when context or quotas are getting tight.
+
 ## Configuration
 
 Vibe is configured via a `config.toml` file. It looks for this file first in `./.vibe/config.toml` and then falls back to `~/.vibe/config.toml`.

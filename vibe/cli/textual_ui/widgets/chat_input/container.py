@@ -22,11 +22,15 @@ from vibe.core.autocompletion.completers import CommandCompleter, PathCompleter
 class ChatInputContainer(Vertical):
     ID_INPUT_BOX = "input-box"
     BORDER_WARNING_CLASS = "border-warning"
+    THINKING_MODE_CLASS = "thinking-mode"
 
     class Submitted(Message):
         def __init__(self, value: str) -> None:
             self.value = value
             super().__init__()
+
+    class ThinkingModeToggleRequested(Message):
+        """Bubble thinking mode toggle requests up to the app."""
 
     def __init__(
         self,
@@ -147,6 +151,11 @@ class ChatInputContainer(Vertical):
         event.stop()
         self.post_message(self.Submitted(event.value))
 
+    def on_chat_input_body_thinking_mode_toggle_requested(
+        self, _: ChatInputBody.ThinkingModeToggleRequested
+    ) -> None:
+        self.post_message(self.ThinkingModeToggleRequested())
+
     def set_show_warning(self, show_warning: bool) -> None:
         self._show_warning = show_warning
 
@@ -155,3 +164,10 @@ class ChatInputContainer(Vertical):
             input_box.add_class(self.BORDER_WARNING_CLASS)
         else:
             input_box.remove_class(self.BORDER_WARNING_CLASS)
+
+    def set_thinking_mode(self, enabled: bool) -> None:
+        input_box = self.get_widget_by_id(self.ID_INPUT_BOX)
+        if enabled:
+            input_box.add_class(self.THINKING_MODE_CLASS)
+        else:
+            input_box.remove_class(self.THINKING_MODE_CLASS)

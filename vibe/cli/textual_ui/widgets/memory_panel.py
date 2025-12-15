@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Sequence
 
 from textual.widgets import Static
@@ -9,12 +10,25 @@ from vibe.core.memory import MemoryEntry
 
 class MemoryEntryCard(Static):
     def __init__(self, entry: MemoryEntry, index: int) -> None:
+        timestamp_source = entry.created_at
+        if not isinstance(timestamp_source, datetime):
+            timestamp_source = datetime.now(UTC)
+        if timestamp_source.tzinfo is None:
+            timestamp_source = timestamp_source.replace(tzinfo=UTC)
+        timestamp = timestamp_source.astimezone().strftime("%H:%M:%S")
+        token_text = (
+            f"~{entry.token_count:,} tokens" if entry.token_count else "token snapshot n/a"
+        )
+        hints = (
+            "\n".join(f"- {hint}" for hint in entry.task_hints if hint.strip())
+            if entry.task_hints
+            else ""
+        )
+        hints_block = f"\n{hints}" if hints else ""
         super().__init__(
-            f"[bold]Memory {index}[/bold]\n{entry.summary.strip()}"
-            + (
-                "\n" + "\n".join(f"- {hint}" for hint in entry.task_hints)
-                if entry.task_hints
-                else ""
+            (
+                f"[bold]Memory {index}[/bold] · {token_text} @ {timestamp}\n"
+                f"{entry.summary.strip()}{hints_block}"
             ),
             classes="memory-entry",
         )
@@ -58,5 +72,5 @@ class MemoryPanel(Static):
             )
             return
 
-        for idx, entry in enumerate(self._entries, 1):
+        for idx, entry in enumerate(reversed(self._entries), 1):
             await self.mount(MemoryEntryCard(entry, idx))

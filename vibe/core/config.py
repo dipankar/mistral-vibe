@@ -287,6 +287,7 @@ class VibeConfig(BaseSettings):
     context_warnings: bool = False
     textual_theme: str = "textual-dark"
     instructions: str = ""
+    planner_auto_start: bool = False
     workdir: Path | None = Field(default=None, exclude=True)
     system_prompt_id: str = "cli"
     include_commit_signature: bool = True
