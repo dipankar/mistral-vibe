@@ -133,6 +133,29 @@ class ToolManager:
     def available_tools(self) -> dict[str, type[BaseTool]]:
         return dict(self._available)
 
+    def filter_tools(
+        self,
+        allowed: list[str] | None = None,
+        denied: list[str] | None = None,
+    ) -> None:
+        """Filter available tools in-place.
+
+        Args:
+            allowed: If provided, only keep tools in this list.
+            denied: If provided, remove tools in this list.
+        """
+        if allowed is not None:
+            allowed_set = set(allowed)
+            to_remove = [name for name in self._available if name not in allowed_set]
+            for name in to_remove:
+                del self._available[name]
+                self._instances.pop(name, None)
+
+        if denied:
+            for name in denied:
+                self._available.pop(name, None)
+                self._instances.pop(name, None)
+
     def _integrate_mcp(self) -> None:
         if not self._config.mcp_servers:
             return

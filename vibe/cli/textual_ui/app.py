@@ -45,6 +45,7 @@ from vibe.cli.textual_ui.widgets.mode_indicator import ModeIndicator
 from vibe.cli.textual_ui.widgets.memory_panel import MemoryPanel
 from vibe.cli.textual_ui.widgets.planner_ticker import PlannerTicker, PlannerTickerState
 from vibe.cli.textual_ui.widgets.path_display import PathDisplay
+from vibe.cli.textual_ui.widgets.sidebar import Sidebar
 from vibe.cli.textual_ui.widgets.tools import ToolCallMessage, ToolResultMessage
 from vibe.cli.textual_ui.widgets.welcome import WelcomeBanner
 from vibe.cli.update_notifier import (
@@ -69,6 +70,8 @@ from vibe.core.planner import (
     PlanStepStatus,
     PlannerAgent,
 )
+from vibe.core.subagent import SubAgent, SubAgentConfig, SubAgentResult
+from vibe.core.system_prompt import get_universal_system_prompt
 from vibe.core.tools.base import BaseToolConfig, ToolPermission
 from vibe.core.types import (
     ApprovalResponse,
@@ -89,7 +92,7 @@ from vibe.core.utils import (
 )
 
 
-THINKING_MODE_INSTRUCTIONS = (
+DEFAULT_THINKING_MODE_INSTRUCTIONS = (
     "You are in thinking mode. Begin with a concise 'Thoughts' section containing no more than "
     "three bullet points that outline reasoning, risks, or next checks. After that, provide an "
     "'Answer' section with actionable guidance. Keep Thoughts under 100 words."
@@ -159,7 +162,7 @@ class VibeApp(App):
         self._plan_state_file = self._build_plan_state_path()
         self._current_bottom_app: BottomApp = BottomApp.Input
         self._planner_auto_start = config.planner_auto_start
-        self._thinking_mode = False
+        self._thinking_mode = config.thinking_mode_enabled
         self.theme = config.textual_theme
 
         self.history_file = HISTORY_FILE.path
@@ -187,6 +190,7 @@ class VibeApp(App):
         self._current_token_state = TokenState()
         self._rate_limit_warning = False
         self._rate_limit_reset_task: asyncio.Task | None = None
+        self._sidebar: Sidebar | None = None
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="app-layout"):
@@ -218,19 +222,17 @@ class VibeApp(App):
                 yield MemoryPanel()
 
             with Vertical(id="sidebar"):
-                with Vertical(id="todo-section"):
-                    yield Static("Todo", id="todo-title")
-                    yield Static("Ctrl+Shift+C copies selection", id="copy-tip")
-                    yield Static("/memory or /mem · memory overlay", id="memory-tip")
-                    with VerticalScroll(id="todo-scroll"):
-                        yield Static(id="todo-area")
+                yield Sidebar()
 
 
     async def on_mount(self) -> None:
+        # Get reference to enhanced sidebar
+        self._sidebar = self.query_one(Sidebar)
+
         self.event_handler = EventHandler(
             mount_callback=self._mount_and_scroll,
             scroll_callback=self._scroll_to_bottom_deferred,
-            todo_area_callback=lambda: self.query_one("#todo-area"),
+            todo_area_callback=lambda: self._sidebar.get_todo_container() if self._sidebar else None,
             get_tools_collapsed=lambda: self._tools_collapsed,
             get_todos_collapsed=lambda: self._todos_collapsed,
         )
@@ -281,10 +283,15 @@ class VibeApp(App):
     ) -> str:
         if not self._thinking_mode:
             return user_text
+        # Use configured instructions or fall back to default
+        instructions = (
+            self.config.thinking_mode_instructions
+            or DEFAULT_THINKING_MODE_INSTRUCTIONS
+        )
         outline_block = (
             f"\n\nPlan Outline:\n{thinking_outline}" if thinking_outline else ""
         )
-        return f"{THINKING_MODE_INSTRUCTIONS}{outline_block}\n\nRequest:\n{user_text}"
+        return f"{instructions}{outline_block}\n\nRequest:\n{user_text}"
 
     def _set_context_tokens(self, state: TokenState) -> None:
         self._current_token_state = state
@@ -416,7 +423,7 @@ class VibeApp(App):
         if plan.decisions:
             outline_lines.append("Decisions:")
             for decision in plan.decisions:
-                options = ", ".join(decision.options) if decision.options else "freeform"
+                options = ", ".join(decision.option_labels()) if decision.options else "freeform"
                 selection = f" → {decision.selection}" if decision.selection else ""
                 outline_lines.append(
                     f"- {decision.decision_id}: {decision.question} ({options}){selection}"
@@ -450,15 +457,8 @@ class VibeApp(App):
         await self._show_memory_panel()
 
     async def _ensure_todo_placeholder(self) -> None:
-        todo_area = self.query_one("#todo-area", Static)
-        if todo_area.children:
-            return
-        await todo_area.mount(
-            Static(
-                "No todo items yet. Use the todo tool to add tasks.",
-                classes="todo-placeholder",
-            )
-        )
+        # TodoPanel now handles empty state automatically
+        pass
 
     async def on_chat_input_container_submitted(
         self, event: ChatInputContainer.Submitted
@@ -493,6 +493,38 @@ class VibeApp(App):
         await self._mount_and_scroll(
             UserCommandMessage(f"Thinking mode {status}. Tab toggles this mode.")
         )
+
+    async def _toggle_thinking_mode(self, argument: str | None = None) -> None:
+        """Toggle or set thinking mode via /think command."""
+        mode = (argument or "").strip().lower()
+        if mode in {"on", "true", "enable", "enabled"}:
+            self._set_thinking_mode(True)
+            await self._mount_and_scroll(
+                UserCommandMessage("Thinking mode enabled.")
+            )
+            return
+        if mode in {"off", "false", "disable", "disabled"}:
+            self._set_thinking_mode(False)
+            await self._mount_and_scroll(
+                UserCommandMessage("Thinking mode disabled.")
+            )
+            return
+
+        # Toggle if no argument
+        self._set_thinking_mode(not self._thinking_mode)
+        status = "enabled" if self._thinking_mode else "disabled"
+        await self._mount_and_scroll(
+            UserCommandMessage(f"Thinking mode {status}.")
+        )
+
+    def _set_thinking_mode(self, enabled: bool, *, persist: bool = False) -> None:
+        """Set thinking mode state and optionally persist to config."""
+        self._thinking_mode = enabled
+        if self._chat_input_container:
+            self._chat_input_container.set_thinking_mode(enabled)
+        self._update_planner_ticker()
+        if persist:
+            VibeConfig.save_updates({"thinking_mode_enabled": enabled})
 
     async def on_approval_app_approval_granted(
         self, message: ApprovalApp.ApprovalGranted
@@ -925,7 +957,7 @@ class VibeApp(App):
             lines.append("")
             lines.append("Pending decisions:")
             for decision in plan.decisions:
-                options = ", ".join(decision.options) if decision.options else "freeform"
+                options = ", ".join(decision.option_labels()) if decision.options else "freeform"
                 decision_status = (
                     f"resolved: {decision.selection}" if decision.resolved else "awaiting input"
                 )
@@ -1061,10 +1093,39 @@ class VibeApp(App):
     async def on_plan_decision_message_decision_selected(
         self, message: PlanDecisionMessage.DecisionSelected
     ) -> None:
-        selection = message.selection.strip()
-        if not selection:
+        selections = [s.strip() for s in message.selections if s.strip()]
+        if not selections:
             return
-        await self._handle_plan_decision(f"{message.decision_id} {selection}")
+        await self._handle_plan_decision_selections(message.decision_id, selections)
+
+    async def _handle_plan_decision_selections(
+        self, decision_id: str, selections: list[str]
+    ) -> None:
+        """Handle decision selections from the new form widget."""
+        if not self._planner_agent or not self._planner_agent.get_plan():
+            await self._mount_and_scroll(
+                UserCommandMessage("No active plan. Start one with `/plan <goal>`.")
+            )
+            return
+        plan = self._planner_agent.decide(decision_id, selections)
+        if not plan:
+            await self._mount_and_scroll(
+                UserCommandMessage(f"Unknown decision `{decision_id}`.")
+            )
+            return
+        await self._refresh_planner_panel(plan)
+        self._update_planner_ticker(plan)
+        selections_text = ", ".join(selections)
+        await self._mount_and_scroll(
+            UserCommandMessage(f"Decision `{decision_id}` recorded: {selections_text}")
+        )
+        decision = next(
+            (item for item in plan.decisions if item.decision_id == decision_id),
+            None,
+        )
+        if decision:
+            await self._emit_decision_event(plan, decision)
+        self._start_plan_executor(plan.plan_id)
 
     async def _emit_plan_events(self, plan: PlanState, include_summary: bool = True) -> None:
         if include_summary:
@@ -1123,13 +1184,19 @@ class VibeApp(App):
     async def _emit_decision_event(
         self, plan: PlanState, decision: PlanDecision
     ) -> None:
+        from vibe.core.types import DecisionOptionData
         event = PlanDecisionEvent(
             plan_id=plan.plan_id,
             decision_id=decision.decision_id,
+            header=decision.header,
             question=decision.question,
-            options=decision.options,
+            options=[
+                DecisionOptionData(label=opt.label, description=opt.description)
+                for opt in decision.options
+            ],
+            multi_select=decision.multi_select,
             resolved=decision.resolved,
-            selection=decision.selection,
+            selections=decision.selections,
         )
         await self._mount_or_update_decision_card(event)
 
@@ -1225,9 +1292,9 @@ class VibeApp(App):
             await self._finalize_current_streaming_message()
             messages_area = self.query_one("#messages")
             await messages_area.remove_children()
-            todo_area = self.query_one("#todo-area")
-            await todo_area.remove_children()
-            await self._ensure_todo_placeholder()
+            # Clear todos in sidebar
+            if self._sidebar:
+                self._sidebar.update_todos([])
 
             if self.agent:
                 current_state = self._current_token_state
@@ -1789,6 +1856,9 @@ class VibeApp(App):
         self._update_planner_ticker(None)
 
     async def _refresh_planner_panel(self, plan: PlanState | None = None) -> None:
+        # Update sidebar plan panel
+        if self._sidebar:
+            self._sidebar.update_plan(plan)
         self._persist_plan_state()
 
     def _start_plan_executor(self, plan_id: str) -> None:
@@ -1849,46 +1919,120 @@ class VibeApp(App):
                 return
             if plan.status in (PlanRunStatus.PAUSED, PlanRunStatus.CANCELLED):
                 return
-            runnable_steps = planner.get_runnable_steps()
-            if not runnable_steps:
-                await self._maybe_mark_plan_complete(plan_id)
-                return
-            for step in runnable_steps:
-                if plan.status in (PlanRunStatus.PAUSED, PlanRunStatus.CANCELLED):
-                    return
+
+            # Get steps that can run in parallel (pending with satisfied dependencies)
+            parallel_steps = planner.get_parallel_runnable_steps()
+
+            # Filter out steps that need decisions or are blocked
+            executable_steps = [
+                step for step in parallel_steps
+                if step.status not in (PlanStepStatus.NEEDS_DECISION, PlanStepStatus.BLOCKED)
+            ]
+
+            # Handle decision-blocked steps
+            for step in parallel_steps:
                 if step.status == PlanStepStatus.NEEDS_DECISION:
                     await self._notify_step_decision_needed(step)
-                    continue
-                if step.status == PlanStepStatus.BLOCKED:
-                    continue
-                await self._update_step_status(step.step_id, PlanStepStatus.IN_PROGRESS)
-                prompt = planner.build_step_prompt(step.step_id)
-                if not prompt:
-                    await self._update_step_status(
-                        step.step_id,
-                        PlanStepStatus.BLOCKED,
-                        notes="Planner missing instructions for this step.",
-                    )
-                    continue
+
+            if not executable_steps:
+                # Check if any steps are still runnable (in_progress)
+                runnable = planner.get_runnable_steps()
+                in_progress = [s for s in runnable if s.status == PlanStepStatus.IN_PROGRESS]
+                if not in_progress and not parallel_steps:
+                    await self._maybe_mark_plan_complete(plan_id)
+                    return
+                # Wait for in-progress steps to complete
+                await asyncio.sleep(0.1)
+                continue
+
+            # Execute steps in parallel if multiple are available
+            if len(executable_steps) > 1:
                 await self._mount_and_scroll(
                     UserCommandMessage(
-                        f"Planner executing step `{step.step_id}` · {step.title}"
+                        f"Executing {len(executable_steps)} steps in parallel: "
+                        + ", ".join(f"`{s.step_id}`" for s in executable_steps)
                     )
                 )
                 await self._wait_for_agent_idle()
-                await self._handle_user_message(prompt)
-                agent_task = self._agent_task
-                if agent_task:
-                    try:
-                        await agent_task
-                    except asyncio.CancelledError:
-                        return
+
+                # Execute all steps in parallel
+                tasks = [
+                    self._execute_single_step(step, planner, plan_id)
+                    for step in executable_steps
+                ]
+                try:
+                    await asyncio.gather(*tasks)
+                except asyncio.CancelledError:
+                    return
+            else:
+                # Execute single step
+                step = executable_steps[0]
+                await self._execute_single_step(step, planner, plan_id)
+
+            await asyncio.sleep(0)
+
+    async def _execute_single_step(
+        self, step: PlanStep, planner: PlannerAgent, plan_id: str
+    ) -> None:
+        """Execute a single plan step using SubAgent."""
+        plan = planner.get_plan()
+        if not plan or plan.status in (PlanRunStatus.PAUSED, PlanRunStatus.CANCELLED):
+            return
+
+        await self._update_step_status(step.step_id, PlanStepStatus.IN_PROGRESS)
+
+        # Set active step indicator in sidebar
+        if self._sidebar:
+            self._sidebar.set_active_step(step.step_id, step.mode)
+
+        prompt = planner.build_step_prompt(step.step_id)
+        if not prompt:
+            await self._update_step_status(
+                step.step_id,
+                PlanStepStatus.BLOCKED,
+                notes="Planner missing instructions for this step.",
+            )
+            if self._sidebar:
+                self._sidebar.set_active_step(None)
+            return
+
+        await self._mount_and_scroll(
+            UserCommandMessage(
+                f"Planner executing step `{step.step_id}` · {step.title} (SubAgent: {step.mode or 'code'})"
+            )
+        )
+
+        # Execute using isolated SubAgent
+        try:
+            result = await self._execute_step_with_subagent(step, prompt)
+
+            if result.success:
                 await self._update_step_status(
                     step.step_id,
                     PlanStepStatus.COMPLETED,
+                    notes=f"Completed in {result.stats.duration_seconds:.1f}s, "
+                    f"{result.stats.total_tokens} tokens",
                 )
-                await self._maybe_mark_plan_complete(plan_id)
-            await asyncio.sleep(0)
+            else:
+                await self._update_step_status(
+                    step.step_id,
+                    PlanStepStatus.BLOCKED,
+                    notes=result.error or "SubAgent execution failed",
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("SubAgent execution failed", exc_info=exc)
+            await self._update_step_status(
+                step.step_id,
+                PlanStepStatus.BLOCKED,
+                notes=f"Error: {exc}",
+            )
+
+        # Clear active step indicator after completion
+        if self._sidebar:
+            self._sidebar.set_active_step(None)
+        await self._maybe_mark_plan_complete(plan_id)
 
     async def _wait_for_agent_idle(self) -> None:
         while True:
@@ -1898,6 +2042,60 @@ class VibeApp(App):
             if not busy:
                 return
             await asyncio.sleep(0.05)
+
+    async def _execute_step_with_subagent(
+        self, step: PlanStep, prompt: str
+    ) -> SubAgentResult:
+        """Execute a plan step using an isolated SubAgent."""
+        from vibe.core.tools.manager import ToolManager
+
+        # Create SubAgent config from step
+        subagent_config = SubAgentConfig(
+            step_id=step.step_id,
+            title=step.title,
+            mode=step.mode or "code",
+            max_turns=20,  # Allow enough turns for complex tasks
+            system_prompt_suffix=(
+                f"\n\n## Current Task\n"
+                f"You are executing step '{step.title}' as part of a larger plan.\n"
+                f"Focus only on completing this specific task."
+            ),
+        )
+
+        # Get base system prompt from a fresh tool manager
+        tool_manager = ToolManager(self.config)
+        base_system_prompt = get_universal_system_prompt(tool_manager, self.config)
+
+        # Create SubAgent
+        subagent = SubAgent(
+            config=self.config,
+            subagent_config=subagent_config,
+            system_prompt=base_system_prompt,
+            parent_approval_callback=self._approval_callback if not self.auto_approve else None,
+            enable_streaming=self.enable_streaming,
+        )
+
+        # Execute and handle events
+        loading = LoadingWidget()
+        self._loading_widget = loading
+        loading_area = self.query_one("#loading-area-content")
+        await loading_area.mount(loading)
+
+        try:
+            async for event in subagent.execute(prompt):
+                # Handle events similar to main agent
+                if self.event_handler:
+                    await self.event_handler.handle_event(
+                        event,
+                        loading_active=self._loading_widget is not None,
+                        loading_widget=self._loading_widget,
+                    )
+        finally:
+            if self._loading_widget and self._loading_widget.parent:
+                await self._loading_widget.remove()
+            self._loading_widget = None
+
+        return subagent.get_result()
 
     async def _update_step_status(
         self, step_id: str, status: PlanStepStatus, notes: str | None = None
@@ -1951,6 +2149,16 @@ class VibeApp(App):
             self._update_planner_ticker(plan)
 
     async def _load_plan_state(self) -> None:
+        # Only load plan state if resuming a session
+        if self._session_info is None:
+            # Starting fresh - clear any old plan state
+            if self._plan_state_file.exists():
+                try:
+                    self._plan_state_file.unlink()
+                except Exception:
+                    pass
+            return
+
         try:
             self._plan_state_file.parent.mkdir(parents=True, exist_ok=True)
         except Exception as exc:

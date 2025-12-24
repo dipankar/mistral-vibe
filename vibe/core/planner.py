@@ -4,15 +4,20 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum, auto
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from vibe.core.config import VibeConfig
 from vibe.core.llm.backend.factory import BACKEND_FACTORY
 from vibe.core.llm.types import BackendLike
+from vibe.core.modes import get_planner_instructions, get_specialist_title
+from vibe.core.planner_resources import PlannerResourceManager, ResourceWarningLevel
 from vibe.core.prompts import UtilityPrompt
 from vibe.core.types import LLMMessage, Role
 from vibe.core.utils import get_user_agent, logger
+
+if TYPE_CHECKING:
+    from vibe.core.subagent import SubAgentStats
 
 
 class PlanStepStatus(StrEnum):
@@ -32,12 +37,38 @@ class PlanRunStatus(StrEnum):
 
 
 @dataclass(slots=True)
+class DecisionOption:
+    """Rich option with label and description for Claude Code-style forms."""
+    label: str
+    description: str = ""
+
+
+@dataclass(slots=True)
 class PlanDecision:
     decision_id: str
+    header: str  # Short chip label like "Database", "Auth Type"
     question: str
-    options: list[str] = field(default_factory=list)
-    selection: str | None = None
+    options: list[DecisionOption] = field(default_factory=list)
+    multi_select: bool = False
+    selections: list[str] = field(default_factory=list)
     resolved: bool = False
+
+    @property
+    def selection(self) -> str | None:
+        """Backward compatibility: return first selection."""
+        return self.selections[0] if self.selections else None
+
+    @selection.setter
+    def selection(self, value: str | None) -> None:
+        """Backward compatibility: set single selection."""
+        if value:
+            self.selections = [value]
+        else:
+            self.selections = []
+
+    def option_labels(self) -> list[str]:
+        """Return list of option labels for backward compat."""
+        return [opt.label for opt in self.options]
 
 
 @dataclass(slots=True)
@@ -49,6 +80,7 @@ class PlanStep:
     notes: str | None = None
     mode: str | None = None
     decision_id: str | None = None
+    depends_on: list[str] = field(default_factory=list)  # List of step IDs this step depends on
 
 
 @dataclass(slots=True)
@@ -66,6 +98,57 @@ class PlanState:
         total = len(self.steps)
         status_label = self.status.value.replace("_", " ").lower()
         return f"Plan '{self.goal}' - {completed}/{total} steps complete ({status_label})"
+
+    def validate_dependencies(self) -> list[str]:
+        """Validate plan dependencies for circular references and missing steps.
+
+        Returns:
+            List of validation error messages (empty if valid).
+        """
+        errors: list[str] = []
+        step_ids = {step.step_id for step in self.steps}
+
+        # Check for missing dependencies and self-loops
+        for step in self.steps:
+            for dep_id in step.depends_on:
+                if dep_id not in step_ids:
+                    errors.append(
+                        f"Step '{step.step_id}' depends on non-existent step '{dep_id}'"
+                    )
+                if dep_id == step.step_id:
+                    errors.append(
+                        f"Step '{step.step_id}' has circular dependency on itself"
+                    )
+
+        # Check for cycles using DFS
+        def has_cycle(node: str, visited: set[str], rec_stack: set[str]) -> bool:
+            visited.add(node)
+            rec_stack.add(node)
+
+            # Find the step and check its dependencies
+            for step in self.steps:
+                if step.step_id == node:
+                    for dep_id in step.depends_on:
+                        if dep_id in step_ids:  # Only check valid deps
+                            if dep_id not in visited:
+                                if has_cycle(dep_id, visited, rec_stack):
+                                    return True
+                            elif dep_id in rec_stack:
+                                return True
+                    break
+
+            rec_stack.remove(node)
+            return False
+
+        visited: set[str] = set()
+        for step in self.steps:
+            if step.step_id not in visited:
+                if has_cycle(step.step_id, visited, set()):
+                    errors.append(
+                        f"Circular dependency detected involving step '{step.step_id}'"
+                    )
+
+        return errors
 
 
 class PlannerAgent:
@@ -85,24 +168,94 @@ class PlannerAgent:
             if backend
             else self._select_backend
         )
+        # Resource management
+        self._resource_manager: PlannerResourceManager | None = None
 
     def get_plan(self) -> PlanState | None:
         return self._current_plan
 
+    @property
+    def resource_manager(self) -> PlannerResourceManager:
+        """Get or create the resource manager for this planner."""
+        if self._resource_manager is None:
+            self._resource_manager = PlannerResourceManager(config=self.config.planner)
+        return self._resource_manager
+
+    def reset_resources(self) -> None:
+        """Reset resource tracking (call when starting a new plan)."""
+        self._resource_manager = PlannerResourceManager(config=self.config.planner)
+
+    def record_step_usage(self, stats: SubAgentStats) -> ResourceWarningLevel:
+        """Record token usage from a completed step.
+
+        Args:
+            stats: Statistics from a SubAgent execution.
+
+        Returns:
+            The current warning level after recording usage.
+        """
+        return self.resource_manager.add_token_usage(
+            prompt=stats.prompt_tokens,
+            completion=stats.completion_tokens,
+        )
+
+    def can_start_step(self, estimated_tokens: int = 10000) -> bool:
+        """Check if we have budget to start a new step."""
+        return self.resource_manager.can_start_step(estimated_tokens)
+
+    def get_resource_summary(self) -> dict[str, str]:
+        """Get a summary of resource usage."""
+        return self.resource_manager.get_status_summary()
+
+    def should_pause_for_resources(self) -> tuple[bool, str]:
+        """Check if execution should pause due to resource constraints."""
+        return self.resource_manager.should_pause_for_resources()
+
     def get_runnable_steps(self) -> list[PlanStep]:
+        """Get steps that are runnable (pending/in_progress with all dependencies satisfied)."""
         plan = self._current_plan
         if not plan:
             return []
-        return [
-            step
+
+        # Build set of completed step IDs
+        completed_ids = {
+            step.step_id
             for step in plan.steps
-            if step.status
-            in (
+            if step.status == PlanStepStatus.COMPLETED
+        }
+
+        runnable = []
+        for step in plan.steps:
+            # Skip already completed or blocked steps
+            if step.status not in (
                 PlanStepStatus.PENDING,
                 PlanStepStatus.IN_PROGRESS,
                 PlanStepStatus.NEEDS_DECISION,
+            ):
+                continue
+
+            # Check if all dependencies are satisfied
+            dependencies_satisfied = all(
+                dep_id in completed_ids for dep_id in step.depends_on
             )
+
+            if dependencies_satisfied:
+                runnable.append(step)
+
+        return runnable
+
+    def get_parallel_runnable_steps(self) -> list[PlanStep]:
+        """Get steps that can be executed in parallel (no mutual dependencies)."""
+        runnable = self.get_runnable_steps()
+
+        # Filter to only pending steps (not already in_progress)
+        # Multiple steps can run in parallel if they have no dependencies on each other
+        pending_runnable = [
+            step for step in runnable
+            if step.status == PlanStepStatus.PENDING
         ]
+
+        return pending_runnable
 
     def build_step_prompt(self, step_id: str) -> str | None:
         plan = self._current_plan
@@ -112,7 +265,7 @@ class PlannerAgent:
         if not step:
             return None
         mode = step.mode or "code"
-        specialist = SPECIALIST_TITLES.get(mode, "the Execution Specialist")
+        specialist = get_specialist_title(mode)
         completed_steps = [
             f"{idx}. {s.title} · done ({s.notes or 'no notes'})"
             for idx, s in enumerate(plan.steps, start=1)
@@ -153,7 +306,7 @@ class PlannerAgent:
             "- Keep changes scoped to this step unless you discover critical blockers.\n"
             "- When finished, summarize the changes, note follow-ups, and mention any files that were touched."
         )
-        mode_guidance = MODE_INSTRUCTIONS.get(mode, MODE_INSTRUCTIONS["code"])
+        mode_guidance = get_planner_instructions(mode)
         segments.append(f"Mode-specific guidance:\n{mode_guidance}")
         return "\n".join(segments)
 
@@ -181,9 +334,34 @@ class PlannerAgent:
 
     async def start_plan(self, goal: str) -> PlanState:
         plan_id = str(uuid4())
+
+        # Reset resource tracking for the new plan
+        self.reset_resources()
+
         try:
             response_text = await self._request_plan(goal.strip())
             plan = self._parse_plan_response(plan_id, goal, response_text)
+
+            # Validate dependencies
+            validation_errors = plan.validate_dependencies()
+            if validation_errors:
+                logger.warning(
+                    "Plan has dependency issues: %s",
+                    "; ".join(validation_errors)
+                )
+                # Fix invalid dependencies by removing them
+                valid_step_ids = {step.step_id for step in plan.steps}
+                for step in plan.steps:
+                    step.depends_on = [
+                        dep for dep in step.depends_on
+                        if dep in valid_step_ids and dep != step.step_id
+                    ]
+
+            # Start timeout tracking for any initial decisions
+            for decision in plan.decisions:
+                if not decision.resolved:
+                    self.resource_manager.start_decision_timeout(decision.decision_id)
+
         except Exception as exc:  # noqa: BLE001
             logger.warning("Planner fallback triggered: %s", exc)
             plan = self._fallback_plan(plan_id, goal, str(exc))
@@ -212,20 +390,60 @@ class PlannerAgent:
             self._current_plan.updated_at = datetime.utcnow()
         self._current_plan = None
 
-    def decide(self, decision_id: str, selection: str) -> PlanState | None:
+    def decide(self, decision_id: str, selections: str | list[str]) -> PlanState | None:
+        """Record user decision(s) for a decision checkpoint.
+
+        Args:
+            decision_id: The decision identifier
+            selections: Single selection string or list of selections for multi-select
+        """
         plan = self._current_plan
         if not plan:
             return None
+        # Normalize to list
+        selection_list = [selections] if isinstance(selections, str) else list(selections)
         for decision in plan.decisions:
             if decision.decision_id == decision_id:
-                decision.selection = selection
+                decision.selections = selection_list
                 decision.resolved = True
                 plan.updated_at = datetime.utcnow()
+
+                # Resolve decision timeout tracking
+                self.resource_manager.resolve_decision(decision_id)
+
                 for step in plan.steps:
                     if step.decision_id == decision_id and step.status == PlanStepStatus.NEEDS_DECISION:
                         step.status = PlanStepStatus.PENDING
                 break
         return plan
+
+    def export_for_logging(self) -> dict[str, Any] | None:
+        """Export plan state with resource info for session logging.
+
+        Returns:
+            Dict suitable for inclusion in session logs, or None if no plan.
+        """
+        plan_dict = self.to_dict()
+        if not plan_dict:
+            return None
+
+        # Add resource summary
+        plan_dict["resources"] = self.get_resource_summary()
+
+        # Add step completion statistics
+        if self._current_plan:
+            completed = sum(
+                1 for s in self._current_plan.steps
+                if s.status == PlanStepStatus.COMPLETED
+            )
+            total = len(self._current_plan.steps)
+            plan_dict["progress"] = {
+                "completed": completed,
+                "total": total,
+                "percent": round(completed / total * 100, 1) if total > 0 else 0,
+            }
+
+        return plan_dict
 
     def to_dict(self) -> dict[str, Any] | None:
         if not self._current_plan:
@@ -243,15 +461,21 @@ class PlannerAgent:
                     "notes": step.notes,
                     "mode": step.mode,
                     "decision_id": step.decision_id,
+                    "depends_on": step.depends_on,
                 }
                 for step in self._current_plan.steps
             ],
             "decisions": [
                 {
                     "id": decision.decision_id,
+                    "header": decision.header,
                     "question": decision.question,
-                    "options": decision.options,
-                    "selection": decision.selection,
+                    "options": [
+                        {"label": opt.label, "description": opt.description}
+                        for opt in decision.options
+                    ],
+                    "multi_select": decision.multi_select,
+                    "selections": decision.selections,
                     "resolved": decision.resolved,
                 }
                 for decision in self._current_plan.decisions
@@ -315,6 +539,9 @@ class PlannerAgent:
             owner = self._safe_str(raw_step.get("owner"))
             notes = self._safe_str(raw_step.get("notes"))
             mode = self._normalize_mode(raw_step.get("mode"))
+            # Parse dependencies
+            raw_depends = raw_step.get("depends_on") or []
+            depends_on = [str(d) for d in raw_depends if d]
             step = PlanStep(
                 step_id=step_id,
                 title=self._safe_str(raw_step.get("title")) or f"Step {index}",
@@ -322,6 +549,7 @@ class PlannerAgent:
                 owner=owner,
                 notes=notes,
                 mode=mode,
+                depends_on=depends_on,
             )
             steps.append(step)
             step_decision = raw_step.get("decision")
@@ -354,13 +582,35 @@ class PlannerAgent:
 
     def _build_decision(self, payload: dict[str, Any], fallback_id: str | None = None) -> PlanDecision:
         decision_id = self._safe_str(payload.get("id")) or fallback_id or str(uuid4())
-        options = payload.get("options") or []
-        option_list = [self._safe_str(opt) for opt in options if self._safe_str(opt)]
+        header = self._safe_str(payload.get("header")) or "Decision"
+        raw_options = payload.get("options") or []
+        options: list[DecisionOption] = []
+        for opt in raw_options:
+            if isinstance(opt, dict):
+                # Rich option with label and description
+                label = self._safe_str(opt.get("label")) or ""
+                description = self._safe_str(opt.get("description")) or ""
+                if label:
+                    options.append(DecisionOption(label=label, description=description))
+            elif isinstance(opt, str) and opt.strip():
+                # Backward compat: simple string option
+                options.append(DecisionOption(label=opt.strip(), description=""))
+
+        # Handle selections (multi-select support)
+        raw_selections = payload.get("selections") or []
+        if not raw_selections:
+            # Backward compat: single selection field
+            single_selection = self._safe_str(payload.get("selection"))
+            raw_selections = [single_selection] if single_selection else []
+        selections = [s for s in raw_selections if isinstance(s, str) and s.strip()]
+
         return PlanDecision(
             decision_id=decision_id,
+            header=header,
             question=self._safe_str(payload.get("question")) or "Need user input",
-            options=option_list,
-            selection=self._safe_str(payload.get("selection")),
+            options=options,
+            multi_select=bool(payload.get("multi_select", False)),
+            selections=selections,
             resolved=bool(payload.get("resolved", False)),
         )
 
@@ -473,6 +723,9 @@ class PlannerAgent:
             if not isinstance(raw, dict):
                 continue
             step_id = str(raw.get("id") or f"{plan_id}-step-{len(steps) + 1}")
+            # Parse dependencies
+            raw_depends = raw.get("depends_on") or []
+            depends_on = [str(d) for d in raw_depends if d]
             step = PlanStep(
                 step_id=step_id,
                 title=self._safe_str(raw.get("title")) or "Untitled Step",
@@ -481,22 +734,40 @@ class PlannerAgent:
                 notes=self._safe_str(raw.get("notes")),
                 mode=self._normalize_mode(raw.get("mode")),
                 decision_id=self._safe_str(raw.get("decision_id")),
+                depends_on=depends_on,
             )
             steps.append(step)
         decisions: list[PlanDecision] = []
         for raw in data.get("decisions") or []:
             if not isinstance(raw, dict):
                 continue
+            # Parse options - handle both old format (list of strings) and new format (list of dicts)
+            raw_options = raw.get("options") or []
+            options: list[DecisionOption] = []
+            for opt in raw_options:
+                if isinstance(opt, dict):
+                    label = self._safe_str(opt.get("label")) or ""
+                    description = self._safe_str(opt.get("description")) or ""
+                    if label:
+                        options.append(DecisionOption(label=label, description=description))
+                elif isinstance(opt, str) and opt.strip():
+                    options.append(DecisionOption(label=opt.strip(), description=""))
+
+            # Handle selections - backward compat with single selection
+            raw_selections = raw.get("selections") or []
+            if not raw_selections:
+                single_selection = self._safe_str(raw.get("selection"))
+                raw_selections = [single_selection] if single_selection else []
+            selections = [s for s in raw_selections if isinstance(s, str) and s.strip()]
+
             decisions.append(
                 PlanDecision(
                     decision_id=self._safe_str(raw.get("id")) or str(uuid4()),
+                    header=self._safe_str(raw.get("header")) or "Decision",
                     question=self._safe_str(raw.get("question")) or "Need input",
-                    options=[
-                        self._safe_str(option) or ""
-                        for option in raw.get("options") or []
-                        if self._safe_str(option)
-                    ],
-                    selection=self._safe_str(raw.get("selection")),
+                    options=options,
+                    multi_select=bool(raw.get("multi_select", False)),
+                    selections=selections,
                     resolved=bool(raw.get("resolved", False)),
                 )
             )
@@ -526,22 +797,5 @@ class PlannerAgent:
             return None
         try:
             return datetime.fromisoformat(str(value))
-        except Exception:
+        except (ValueError, TypeError):
             return None
-SPECIALIST_TITLES = {
-    "code": "the Implementation Specialist",
-    "test": "the Validation Specialist",
-    "research": "the Research Strategist",
-    "design": "the Design Architect",
-    "docs": "the Documentation Specialist",
-    "run": "the Execution Specialist",
-}
-
-MODE_INSTRUCTIONS = {
-    "code": "- Focus on writing or editing code with best practices.\n- Update files and explain key changes.",
-    "test": "- Emphasize testing: create or update tests, run suites, and report outcomes.\n- Highlight coverage gaps.",
-    "research": "- Gather information from the repo (read files/search) and summarize findings.\n- Do not modify files unless necessary.",
-    "design": "- Outline implementation approaches, trade-offs, and decisions before coding.\n- Produce actionable guidance.",
-    "docs": "- Update documentation, READMEs, or comments to reflect changes.\n- Keep explanations user-friendly.",
-    "run": "- Execute commands or scripts, capture output, and interpret results.\n- Validate that goals are met.",
-}

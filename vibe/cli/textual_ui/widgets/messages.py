@@ -173,108 +173,251 @@ class PlanStartedMessage(Static):
         yield Markdown(summary)
 
 
+class DecisionOptionCard(Static):
+    """Single option card with radio/checkbox indicator, label, and description."""
+
+    class Clicked(Message):
+        def __init__(self, label: str) -> None:
+            super().__init__()
+            self.label = label
+
+    def __init__(
+        self,
+        label: str,
+        description: str = "",
+        multi_select: bool = False,
+        selected: bool = False,
+    ) -> None:
+        super().__init__()
+        self.add_class("decision-option-card")
+        self._label = label
+        self._description = description
+        self._multi_select = multi_select
+        self._selected = selected
+        if selected:
+            self.add_class("selected")
+
+    def compose(self) -> ComposeResult:
+        indicator = self._get_indicator()
+        with Horizontal(classes="option-card-row"):
+            yield Static(indicator, classes="option-indicator")
+            with Vertical(classes="option-content"):
+                yield Static(self._label, classes="option-label")
+                if self._description:
+                    yield Static(self._description, classes="option-description")
+
+    def _get_indicator(self) -> str:
+        if self._multi_select:
+            return "☑" if self._selected else "☐"
+        return "●" if self._selected else "○"
+
+    def set_selected(self, selected: bool) -> None:
+        self._selected = selected
+        if selected:
+            self.add_class("selected")
+        else:
+            self.remove_class("selected")
+        # Update indicator
+        indicator = self.query_one(".option-indicator", Static)
+        indicator.update(self._get_indicator())
+
+    @property
+    def selected(self) -> bool:
+        return self._selected
+
+    @property
+    def label(self) -> str:
+        return self._label
+
+    async def on_click(self) -> None:
+        self.post_message(self.Clicked(self._label))
+
+
 class PlanDecisionMessage(Static):
+    """Claude Code-style decision form with rich options, descriptions, and multi-select support."""
+
     class DecisionSelected(Message):
-        def __init__(self, decision_id: str, selection: str) -> None:
+        def __init__(self, decision_id: str, selections: list[str]) -> None:
             super().__init__()
             self.decision_id = decision_id
-            self.selection = selection
+            self.selections = selections
+
+        @property
+        def selection(self) -> str | None:
+            """Backward compatibility."""
+            return self.selections[0] if self.selections else None
 
     def __init__(self, event: PlanDecisionEvent) -> None:
         super().__init__()
         self.add_class("plan-message")
-        self.add_class("plan-decision-update")
+        self.add_class("plan-decision-form")
         self._event = event
-        self._markdown: Markdown | None = None
-        self._controls: Vertical | None = None
-        self._input: Input | None = None
-        self._submit_button: Button | None = None
-        self._option_buttons: dict[str, str] = {}
+        self._option_cards: dict[str, DecisionOptionCard] = {}
+        self._other_input: Input | None = None
+        self._other_card: DecisionOptionCard | None = None
+        self._confirm_button: Button | None = None
 
     def compose(self) -> ComposeResult:
-        with Vertical():
-            self._markdown = Markdown("")
-            yield self._markdown
-            controls = Vertical(classes="plan-decision-controls")
-            self._controls = controls
-            yield controls
+        with Vertical(classes="decision-form-container"):
+            # Header chip
+            yield Static(self._event.header, classes="decision-header-chip")
+
+            # Question
+            yield Static(self._event.question, classes="decision-question")
+
+            # Options container
+            options_container = Vertical(classes="decision-options")
+            yield options_container
+
+            # Confirm button (shown when not resolved)
+            if not self._event.resolved:
+                yield Button("Confirm", id="decision-confirm", classes="decision-confirm-btn")
 
     async def on_mount(self) -> None:
-        await self._render()
+        await self._render_options()
 
     async def update_event(self, event: PlanDecisionEvent) -> None:
         self._event = event
-        await self._render()
+        await self._render_options()
 
-    async def _render(self) -> None:
-        if not self._markdown or not self._controls:
-            return
+    async def _render_options(self) -> None:
+        options_container = self.query_one(".decision-options", Vertical)
+        await options_container.remove_children()
+        self._option_cards = {}
+        self._other_input = None
+        self._other_card = None
 
-        options_list = (
-            "\n".join(f"- `{option}`" for option in self._event.options)
-            if self._event.options
-            else "Freeform response"
-        )
-        status_line = (
-            f"Selection: `{self._event.selection}`"
-            if self._event.resolved and self._event.selection
-            else "Awaiting selection"
-        )
-        body = (
-            f"**Decision {self._event.decision_id}**\n\n"
-            f"{self._event.question}\n\n"
-            f"Options:\n{options_list}\n\n"
-            f"{status_line}"
-        )
-        self._markdown.update(body)
+        # Update header and question
+        header_widget = self.query_one(".decision-header-chip", Static)
+        header_widget.update(self._event.header)
 
-        await self._controls.remove_children()
-        self._input = None
-        self._submit_button = None
-        self._option_buttons = {}
+        question_widget = self.query_one(".decision-question", Static)
+        question_widget.update(self._event.question)
 
         if self._event.resolved:
-            await self._controls.mount(
-                Static("Decision captured. No further action required.", classes="plan-decision-status")
+            # Show resolved state
+            selections_text = ", ".join(self._event.selections) if self._event.selections else "None"
+            resolved_msg = Static(
+                f"✓ Selected: {selections_text}",
+                classes="decision-resolved-status"
             )
+            await options_container.mount(resolved_msg)
+
+            # Hide confirm button
+            try:
+                confirm_btn = self.query_one("#decision-confirm", Button)
+                confirm_btn.display = False
+            except Exception:
+                pass
             return
 
-        if self._event.options:
-            container = Horizontal(classes="plan-decision-buttons")
-            await self._controls.mount(container)
-            for index, option in enumerate(self._event.options):
-                button_id = f"decision-option-{self._event.decision_id}-{index}"
-                button = Button(
-                    option,
-                    id=button_id,
-                    classes="plan-decision-button",
-                )
-                self._option_buttons[button_id] = option
-                await container.mount(button)
-            return
+        # Render option cards
+        for opt in self._event.options:
+            is_selected = opt.label in self._event.selections
+            card = DecisionOptionCard(
+                label=opt.label,
+                description=opt.description,
+                multi_select=self._event.multi_select,
+                selected=is_selected,
+            )
+            self._option_cards[opt.label] = card
+            await options_container.mount(card)
 
-        self._input = Input(placeholder="Enter your decision…", classes="plan-decision-input")
-        await self._controls.mount(self._input)
-        submit_id = f"decision-submit-{self._event.decision_id}"
-        self._submit_button = Button(
-            "Submit decision",
-            id=submit_id,
-            classes="plan-decision-button",
+        # Always add "Other" option with input
+        other_container = Vertical(classes="other-option-container")
+        await options_container.mount(other_container)
+
+        self._other_card = DecisionOptionCard(
+            label="Other...",
+            description="Provide a custom response",
+            multi_select=self._event.multi_select,
+            selected=False,
         )
-        await self._controls.mount(self._submit_button)
+        await other_container.mount(self._other_card)
+
+        self._other_input = Input(
+            placeholder="Enter custom response...",
+            classes="other-option-input",
+        )
+        self._other_input.display = False
+        await other_container.mount(self._other_input)
+
+        # Show confirm button
+        try:
+            confirm_btn = self.query_one("#decision-confirm", Button)
+            confirm_btn.display = True
+        except Exception:
+            pass
+
+    def on_decision_option_card_clicked(self, event: DecisionOptionCard.Clicked) -> None:
+        """Handle option card clicks."""
+        if self._event.resolved:
+            return
+
+        clicked_label = event.label
+
+        # Handle "Other" option
+        if clicked_label == "Other..." and self._other_card:
+            if self._event.multi_select:
+                # Toggle other card
+                new_state = not self._other_card.selected
+                self._other_card.set_selected(new_state)
+                if self._other_input:
+                    self._other_input.display = new_state
+                    if new_state:
+                        self._other_input.focus()
+            else:
+                # Single select - deselect all others
+                for card in self._option_cards.values():
+                    card.set_selected(False)
+                self._other_card.set_selected(True)
+                if self._other_input:
+                    self._other_input.display = True
+                    self._other_input.focus()
+            return
+
+        # Handle regular options
+        if clicked_label in self._option_cards:
+            card = self._option_cards[clicked_label]
+
+            if self._event.multi_select:
+                # Toggle selection
+                card.set_selected(not card.selected)
+            else:
+                # Single select - deselect all others first
+                for other_card in self._option_cards.values():
+                    other_card.set_selected(False)
+                if self._other_card:
+                    self._other_card.set_selected(False)
+                    if self._other_input:
+                        self._other_input.display = False
+                card.set_selected(True)
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
-        button = event.button
-        button_id = button.id or ""
-        if button_id in self._option_buttons:
-            selection = self._option_buttons[button_id]
-            self.post_message(self.DecisionSelected(self._event.decision_id, selection))
+        """Handle confirm button press."""
+        if event.button.id != "decision-confirm":
             return
 
-        if self._submit_button and button_id == self._submit_button.id and self._input:
-            selection = self._input.value.strip()
-            if selection:
-                self.post_message(self.DecisionSelected(self._event.decision_id, selection))
+        selections = self._get_current_selections()
+        if selections:
+            self.post_message(self.DecisionSelected(self._event.decision_id, selections))
+
+    def _get_current_selections(self) -> list[str]:
+        """Collect all selected options."""
+        selections: list[str] = []
+
+        # Check regular option cards
+        for label, card in self._option_cards.items():
+            if card.selected:
+                selections.append(label)
+
+        # Check "Other" option
+        if self._other_card and self._other_card.selected and self._other_input:
+            custom_value = self._other_input.value.strip()
+            if custom_value:
+                selections.append(custom_value)
+
+        return selections
 
 
 class SubagentStatusMessage(Static):
@@ -361,7 +504,8 @@ class ThinkingPlanMessage(Static):
         if self._plan.decisions:
             decision_lines = []
             for decision in self._plan.decisions:
-                opts = ", ".join(decision.options) if decision.options else "freeform"
+                # Use option_labels() method for backward compat with new DecisionOption format
+                opts = ", ".join(decision.option_labels()) if decision.options else "freeform"
                 decision_lines.append(f"- {decision.decision_id}: {decision.question} ({opts})")
             decisions = "\n\n**Decisions to watch**\n" + "\n".join(decision_lines)
         summary = (

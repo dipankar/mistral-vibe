@@ -102,6 +102,12 @@ class CommandRegistry:
                 handler="_handle_plan_decision",
                 accepts_argument=True,
             ),
+            "think": Command(
+                aliases=frozenset(["/think", "/thinking"]),
+                description="Toggle thinking mode (`/think`, `/think on`, `/think off`)",
+                handler="_toggle_thinking_mode",
+                accepts_argument=True,
+            ),
         }
 
         for command in excluded_commands:

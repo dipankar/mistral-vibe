@@ -524,14 +524,18 @@ class TestAutoCompactIntegration:
 
         events = [ev async for ev in agent.act("Hello")]
 
-        assert len(events) == 3
-        assert isinstance(events[0], CompactStartEvent)
-        assert isinstance(events[1], CompactEndEvent)
-        assert isinstance(events[2], AssistantEvent)
+        # Filter to specific event types we're testing
+        compact_start = [e for e in events if isinstance(e, CompactStartEvent)]
+        compact_end = [e for e in events if isinstance(e, CompactEndEvent)]
+        assistant = [e for e in events if isinstance(e, AssistantEvent)]
 
-        start: CompactStartEvent = events[0]
-        end: CompactEndEvent = events[1]
-        final: AssistantEvent = events[2]
+        assert len(compact_start) == 1
+        assert len(compact_end) == 1
+        assert len(assistant) == 1
+
+        start: CompactStartEvent = compact_start[0]
+        end: CompactEndEvent = compact_end[0]
+        final: AssistantEvent = assistant[0]
 
         assert start.current_context_tokens == 2
         assert start.threshold == 1

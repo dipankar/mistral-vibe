@@ -126,6 +126,38 @@ class SessionLoggingConfig(BaseSettings):
         return str(Path(v).expanduser().resolve())
 
 
+class PlannerConfig(BaseSettings):
+    """Configuration for the planning mode."""
+
+    enabled: bool = Field(
+        default=True, description="Enable planning commands (/plan)"
+    )
+    auto_run: bool = Field(
+        default=False,
+        description="Automatically start execution after plan generation",
+    )
+    max_parallel_steps: int = Field(
+        default=1,
+        ge=1,
+        le=5,
+        description="Maximum number of steps to execute in parallel",
+    )
+    decision_timeout_seconds: int = Field(
+        default=0,
+        ge=0,
+        description="Timeout for user decisions (0 = no timeout)",
+    )
+    max_context_tokens: int = Field(
+        default=100_000,
+        ge=10_000,
+        description="Maximum context tokens for planner operations",
+    )
+    enable_persistence: bool = Field(
+        default=True,
+        description="Persist plan state to disk for resume after restart",
+    )
+
+
 class Backend(StrEnum):
     MISTRAL = auto()
     GENERIC = auto()
@@ -188,7 +220,7 @@ class _MCPHttpFields(BaseModel):
             if not any(h.lower() == target.lower() for h in hdrs):
                 try:
                     value = (self.api_key_format or "{token}").format(token=token)
-                except Exception:
+                except (KeyError, IndexError, ValueError):
                     value = token
                 hdrs[target] = value
         return hdrs
@@ -288,6 +320,12 @@ class VibeConfig(BaseSettings):
     textual_theme: str = "textual-dark"
     instructions: str = ""
     planner_auto_start: bool = False
+    thinking_mode_enabled: bool = False
+    thinking_mode_instructions: str = (
+        "You are in thinking mode. Begin with a concise 'Thoughts' section containing no more than "
+        "three bullet points that outline reasoning, risks, or next checks. After that, provide an "
+        "'Answer' section with actionable guidance. Keep Thoughts under 100 words."
+    )
     workdir: Path | None = Field(default=None, exclude=True)
     system_prompt_id: str = "cli"
     include_commit_signature: bool = True
@@ -303,6 +341,7 @@ class VibeConfig(BaseSettings):
 
     project_context: ProjectContextConfig = Field(default_factory=ProjectContextConfig)
     session_logging: SessionLoggingConfig = Field(default_factory=SessionLoggingConfig)
+    planner: PlannerConfig = Field(default_factory=PlannerConfig)
     tools: dict[str, BaseToolConfig] = Field(default_factory=dict)
     tool_paths: list[str] = Field(
         default_factory=list,

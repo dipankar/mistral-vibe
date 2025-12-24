@@ -15,6 +15,7 @@ from vibe.core.config import (
 from vibe.core.config_path import CONFIG_FILE, HISTORY_FILE, INSTRUCTIONS_FILE
 from vibe.core.interaction_logger import InteractionLogger
 from vibe.core.programmatic import run_programmatic
+from vibe.core.session_lock import is_session_active, acquire_session_lock, release_session_lock
 from vibe.core.types import OutputFormat, ResumeSessionInfo
 from vibe.core.utils import ConversationLimitException
 from vibe.setup.onboarding import run_onboarding
@@ -163,6 +164,49 @@ def main() -> None:  # noqa: PLR0912, PLR0915
 
         loaded_messages = None
         session_info = None
+
+        # Check if another session is already running
+        active, active_pid, active_time = is_session_active()
+        if active:
+            rprint(
+                f"[red]Another vibe session is already running[/] "
+                f"(PID: {active_pid}, started: {active_time})"
+            )
+            rprint("[dim]Only one interactive session can run at a time.[/]")
+            sys.exit(1)
+
+        # Acquire session lock for interactive mode
+        if args.prompt is None:
+            if not acquire_session_lock():
+                rprint("[red]Failed to acquire session lock[/]")
+                sys.exit(1)
+
+        # Check if user wants to resume a previous session (interactive mode only)
+        if (
+            not args.continue_session
+            and not args.resume
+            and args.prompt is None
+            and config.session_logging.enabled
+        ):
+            latest_session = InteractionLogger.find_latest_session(
+                config.session_logging
+            )
+            if latest_session:
+                try:
+                    _, metadata = InteractionLogger.load_session(latest_session)
+                    session_id = metadata.get("session_id", "unknown")[:8]
+                    session_time = metadata.get("start_time", "unknown time")
+
+                    rprint(f"\n[cyan]Previous session found:[/] {session_id} from {session_time}")
+                    response = input("Resume previous session? [y/N]: ").strip().lower()
+
+                    if response in ("y", "yes"):
+                        args.continue_session = True
+                        rprint("[green]Resuming session...[/]\n")
+                    else:
+                        rprint("[dim]Starting fresh session...[/]\n")
+                except Exception:
+                    pass  # Silently ignore errors checking for previous sessions
 
         if args.continue_session or args.resume:
             if not config.session_logging.enabled:

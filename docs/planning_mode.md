@@ -1,180 +1,355 @@
-# Planning Mode Proposal
+# Planning Mode
 
-## Purpose
+Planning mode enables a deliberate "plan → execute" workflow in Vibe. The planner decomposes complex goals into structured steps, manages dependencies, handles decision checkpoints, and orchestrates execution through isolated subagents.
 
-Add a Claude-style planning workflow to Vibe so users can opt into a deliberate “plan → execute” cycle. The planner should:
+## Quick Start
 
-- Generate and maintain a structured plan (steps, owners, status) for a user goal.
-- Ask for key decisions before executing risky or ambiguous steps.
-- Delegate execution to scoped subagents that run existing Vibe tools.
-- Surface progress in the UI by reusing the todo tab’s lower half when planning is active.
+```bash
+# Start planning for a goal
+/plan Refactor the authentication module to use JWT tokens
 
-## User Flow
+# Check progress
+/plan status
 
-1. User runs `/plan <goal>` (or `/plan` to start an interactive prompt).
-2. PlannerAgent drafts a plan: numbered steps, dependencies, open questions.
-3. User reviews within the sidebar; planner highlights “decision checkpoints” and prompts for confirmations or parameter choices.
-4. Once confirmed, planner executes steps sequentially (or concurrently when safe) by launching SubAgents.
-5. Each subagent streams events (tool calls, outputs) into chat as usual. When completed, planner updates the plan status and stores a summarized artifact.
-6. User can inspect progress via `/plan status`, pause via `/plan pause`, resume with `/plan resume`, or cancel (`/plan cancel`).
+# Pause/resume execution
+/plan pause
+/plan resume
 
-## Commands
+# Cancel and clean up
+/plan cancel
+```
+
+## Commands Reference
 
 | Command | Description |
 |---------|-------------|
-| `/plan [goal]` | Start planning for the provided goal (or prompt user if omitted). |
-| `/plan status` | Show the current plan, step statuses, and outstanding decisions. |
-| `/plan pause` | Pause the active planner (no new steps start). |
-| `/plan resume` | Resume after a pause or after decisions have been provided. |
-| `/plan cancel` | Abort planning mode, cleaning up planner/subagent state. |
+| `/plan [goal]` | Start planning for the provided goal (prompts if omitted) |
+| `/plan status` | Show current plan, step statuses, and outstanding decisions |
+| `/plan pause` | Pause execution (no new steps start) |
+| `/plan resume` | Resume after pause or after decisions provided |
+| `/plan cancel` | Abort planning, clean up state |
+| `/plan auto on\|off` | Toggle auto-start execution after plan generation |
+| `/plan decide <id> <choice>` | Record a decision and unblock waiting steps |
 
-All commands belong to `PlannerCommand` entries in `CommandRegistry` and display in `/help`.
+## User Flow
 
-## Planner Architecture
+1. **Initiate**: Run `/plan <goal>` to start planning
+2. **Review**: PlannerAgent generates a structured plan with numbered steps, dependencies, and open questions
+3. **Decide**: If the planner needs input, it presents decision prompts in the chat and sidebar
+4. **Execute**: Steps execute sequentially or in parallel (when dependencies allow)
+5. **Monitor**: Track progress via `/plan status` or the sidebar panel
+6. **Complete**: Plan finalizes when all steps succeed
 
-### PlannerAgent
+## Architecture
 
-New orchestrator module (`vibe/core/planner.py`). Responsibilities:
+### Core Components
 
-- **Planning Prompt**: uses a planner-specific system prompt emphasizing decomposition and decision capture.
-- **Plan Graph**: Maintains `PlanState` containing:
-  - `PlanMetadata`: goal, author, timestamps.
-  - `PlanStep`: `id`, `description`, `status` (`pending`, `awaiting_decision`, `in_progress`, `blocked`, `done`), `owner`, `dependencies`, `artifacts`.
-  - `DecisionRequest`: `id`, `question`, `options`, `context`. Planner blocks execution when a decision is pending.
-- **Execution Loop**:
-  1. `build_plan(goal) -> PlanState`
-  2. Emit `PlanStartedEvent`
-  3. For each runnable step:
-     - If the step contains a decision checkpoint, emit `PlanDecisionEvent` and wait for `/plan decide <id> <choice>`.
-     - Otherwise, spawn `SubAgentRunner` with step-specific instructions.
-  4. On completion/error, update PlanState, emit `PlanStepUpdateEvent`.
-  5. Once all steps succeed, emit `PlanCompletedEvent`.
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        PlannerAgent                         │
+│  vibe/core/planner.py                                       │
+│  - Decomposes goals into PlanState with steps & decisions   │
+│  - Validates dependencies (circular, missing, self-refs)    │
+│  - Manages execution lifecycle (pause/resume/cancel)        │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                         SubAgent                            │
+│  vibe/core/subagent.py                                      │
+│  - Isolated execution environment per step                  │
+│  - Mode-aware prompts (code, test, research, etc.)          │
+│  - Token budget management                                  │
+│  - Tool filtering per step                                  │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                       Mode Catalog                          │
+│  vibe/core/modes.py                                         │
+│  - Unified guidance for planner step creation               │
+│  - Detailed instructions for subagent execution             │
+└─────────────────────────────────────────────────────────────┘
+```
 
-- **Shared Memory & Context Budget**: Planner owns `PlanningMemory`, which references:
-  - `session_memory` summaries (shared context).
-  - Step artifacts (diffs, logs, generated files).
-  - Lessons learned or constraints to inform later steps.
-  - `context_budget`: remaining tokens relative to both session auto-compact threshold and planner-specific `max_context_tokens`.
-  - `rate_limit_budget`: remaining retries/backoff state when upstream providers throttle requests.
-  - Before launching a subagent, planner estimates token usage; if it would exceed the budget, planner either auto-compacts, trims history, or pauses to ask the user whether to discard older steps.
-  - Planner tracks rate-limit errors per step and uses exponential backoff + jitter; if the retry budget is exhausted, the planner surfaces a decision prompt (“Wait longer?” / “Skip step?”).
+### Data Structures
 
-### SubAgents
+**PlanState** (`vibe/core/planner.py`):
+- `plan_id`: Unique identifier
+- `goal`: User's original objective
+- `status`: `IDLE | ACTIVE | PAUSED | COMPLETED | CANCELLED`
+- `steps`: List of `PlanStep` objects
+- `decisions`: Dict of `PlanDecision` objects
+- `created_at`, `updated_at`: Timestamps
 
-Reuse `vibe.core.agent.Agent`, but wrap it in `SubAgentRunner` that supplies:
+**PlanStep**:
+- `step_id`: Unique step identifier
+- `title`: Human-readable description
+- `status`: `PENDING | IN_PROGRESS | BLOCKED | NEEDS_DECISION | COMPLETED`
+- `mode`: Execution mode (`code`, `test`, `research`, `design`, `docs`, `run`)
+- `owner`: Specialist type
+- `notes`: Execution notes/results
+- `depends_on`: List of step IDs this step depends on
+- `decision_id`: Optional link to a decision that must be resolved first
 
-- `subagent_id` (for auditing), `step_id`.
-- Specialty-aware system prompt: `[PLANNER CONTEXT] Step #n: <description>` followed by `mode`-specific guidance (`code`, `test`, `research`, `design`, `docs`, `run`). Planner sets `PlanStep.mode`, letting the execution agent adapt instructions without changing core tools.
-- Filtered tool permissions (can mirror user config or tighten).
-- After completion, `SubAgentRunner` returns `SubAgentResult`:
-  - `status`: success/failure
-  - `summary`: short string for planner memory
-  - `artifacts`: references to modified files, outputs, tool logs.
-  - `context_delta`: tokens consumed and memory impact so planner can update the remaining context budget.
+**PlanDecision**:
+- `decision_id`: Unique identifier
+- `header`: Short label for UI
+- `question`: Full question text
+- `options`: List of `DecisionOption` (label + description)
+- `multi_select`: Whether multiple options can be selected
+- `selections`: User's choices
+- `resolved`: Whether the decision has been made
 
-Specialists can be added later (e.g., `TestAgent`, `ResearchAgent`), but MVP uses a single subagent implementation with configurable modes.
+### Dependency Validation
 
-## UI Integration
+Before execution, `PlanState.validate_dependencies()` checks for:
 
-### Sidebar Reuse
+1. **Missing references**: Dependencies pointing to non-existent steps
+2. **Self-dependencies**: Steps depending on themselves
+3. **Circular dependencies**: Using DFS cycle detection
 
-- Todo sidebar is vertically split:
-  - **Top Half**: existing todo feed.
-  - **Bottom Half**: “Planner Panel” when planning mode is active.
-- When planner is idle, lower half shows a CTA (“Run `/plan <goal>` to start planning”).
-- Planner Panel contents:
-  - Plan title + status.
-  - Collapsible list of steps with badges (`Pending`, `Needs decision`, `Running`, `Done`, `Blocked`).
-  - Decision prompts appear inline with buttons (e.g., “Approve plan”, “Choose option A/B”) or instruct the user to run `/plan decide`.
-- If no plan is active, the bottom half reverts to todo content (existing behavior).
+Invalid dependencies are automatically removed with warnings logged.
 
-### Chat Stream
+### Execution Modes
 
-- New textual widgets for planning events:
-  - `PlanStartedMessage`
-  - `PlanStepMessage` (updates)
-  - `PlanDecisionPrompt`
-  - `PlanCompletedMessage`
-- Planner decisions show as interactive prompts in chat plus mirrored in the sidebar to ensure visibility.
+The unified mode catalog (`vibe/core/modes.py`) provides consistent guidance:
+
+| Mode | Specialist Title | Purpose |
+|------|------------------|---------|
+| `code` | Implementation Specialist | Writing/editing code with best practices |
+| `test` | Validation Specialist | Creating tests, running suites, coverage analysis |
+| `research` | Research Strategist | Gathering information, reading files, summarizing |
+| `design` | Design Architect | Planning approaches, analyzing trade-offs |
+| `docs` | Documentation Specialist | Updating READMEs, comments, docstrings |
+| `run` | Execution Specialist | Running commands, capturing output, validation |
+
+Each mode provides:
+- `planner_guidance`: Instructions for the planner when creating steps
+- `subagent_guidance`: Detailed instructions for subagent execution
+- `icon`: Visual indicator for UI display
+
+## SubAgent Execution
+
+SubAgents are isolated execution environments for individual plan steps:
+
+### Features
+
+- **Identity & Tracking**: Each subagent has a unique `subagent_id` and `step_id`
+- **Event Tagging**: All events include `subagent_id` and `subagent_step_id` for traceability
+- **Tool Filtering**: Uses `ToolManager.filter_tools(allowed, denied)` per step
+- **Token Budget**: Checked both before AND after LLM responses
+- **Approval Handling**: Inherits parent agent's approval callback (sync and async)
+
+### SubAgentConfig
+
+```python
+SubAgentConfig(
+    step_id="step_1",
+    title="Implement JWT validation",
+    mode="code",
+    allowed_tools=["read_file", "write_file", "search_replace"],
+    denied_tools=["bash"],
+    max_tokens=50000,
+    max_turns=10,
+    system_prompt_suffix="Focus on security best practices."
+)
+```
+
+### SubAgentResult
+
+```python
+SubAgentResult(
+    status="success",  # or "failure"
+    output="Final assistant response...",
+    error=None,        # Error message if failed
+    stats={
+        "prompt_tokens": 1234,
+        "completion_tokens": 567,
+        "tool_calls": 5,
+        "tool_successes": 5,
+        "tool_failures": 0,
+        "duration_seconds": 12.5
+    },
+    artifacts=[]       # References to modified files
+)
+```
 
 ## Decision Checkpoints
 
-Planner should explicitly ask before:
+The planner requests user decisions before:
 
-1. Executing destructive steps (e.g., rewriting large files).
-2. Choosing between strategies (e.g., “Refactor vs rewrite”).
-3. Running risky commands (shell operations).
+1. **Destructive operations**: Rewriting large files, deleting content
+2. **Strategy choices**: "Refactor vs rewrite", "Library A vs B"
+3. **Risky commands**: Shell operations with side effects
 
-Workflow:
+### Workflow
 
-- `PlanDecisionEvent` includes `question`, `options`, and `default`.
-- User responds via `/plan decide <id> <option>` or by clicking an actionable button when UI support lands.
-- Planner stores the decision in `PlanState.decisions` and resumes execution.
+1. Planner emits `PlanDecisionEvent` with question and options
+2. Decision appears in chat as an interactive prompt
+3. User responds via `/plan decide <id> <choice>` or UI button
+4. Planner stores decision and unblocks waiting steps
 
-## Event & Type Additions
+### Multi-Select Decisions
 
-Extend `vibe/core/types.py` with:
+For decisions allowing multiple selections:
 
-- `class PlanEvent(BaseEvent)`
-- `class PlanStartedEvent(PlanEvent)`
-- `class PlanStepUpdateEvent(PlanEvent)`
-- `class PlanDecisionEvent(PlanEvent)`
-- `class PlanCompletedEvent(PlanEvent)`
+```bash
+# Single selection
+/plan decide auth_method jwt
 
-Each carries enough data for UI rendering and logging (plan id, step id, status, summaries).
+# Multiple selections (comma-separated)
+/plan decide features "auth,logging,metrics"
+```
+
+## UI Integration
+
+### Sidebar Panel
+
+When planning is active, the sidebar shows:
+- Plan title and overall status
+- Collapsible step list with status badges
+- Progress bar (`[███░░░░░░░░░░░░] 3/10`)
+- Decision prompts with actionable buttons
+
+### Status Bar Ticker
+
+The bottom bar displays:
+- Current goal (truncated)
+- Step progress
+- Pending decisions count
+- Active subagent indicator
+- Context/rate limit warnings
+
+### Chat Stream
+
+Planning events render as:
+- `PlanStartedMessage`: Plan overview with steps
+- `PlanStepMessage`: Step status updates
+- `PlanDecisionPrompt`: Interactive decision UI
+- `PlanCompletedMessage`: Final summary
+
+## Persistence
+
+Plan state persists to `~/.vibe/plans/<slug>.json`:
+
+- `<slug>` is derived from the workspace path hash
+- Payload includes `instance_id` and `PID` to avoid conflicts
+- On app startup, active plans can be resumed automatically
+- Corrupt JSON is ignored gracefully
 
 ## Configuration
 
-Add new config entries (`[planner]` section):
+Add to `~/.vibe/config.toml`:
 
-- `enabled` (default true)
-- `auto_run` (whether to auto-start execution after plan generation)
-- `max_subagents`
-- `decision_timeout_seconds`
-- `max_context_tokens` (planner-level cap across subagents)
-- `retry_strategy` (controls rate-limit handling and backoffs)
+```toml
+[planner]
+enabled = true                    # Enable planning commands
+auto_run = false                  # Auto-start execution after plan generation
+max_parallel_steps = 1            # Max concurrent step executions
+decision_timeout_seconds = 0      # 0 = no timeout
+max_context_tokens = 100000       # Token budget for planner context
+enable_persistence = true         # Save plan state to disk
+```
 
-Expose toggles in `/config` later if needed.
+Or toggle auto-start at runtime:
+```bash
+/plan auto on
+/plan auto off
+```
 
-## Implementation Phases
+## Events
 
-1. **Spec & Data Structures**
-   - Add planner module, plan models (`PlanState`, `PlanStep`, `DecisionRequest`).
-   - Extend command registry with `/plan` commands.
-   - Define new events and placeholder UI widgets.
+Planning emits these events for UI and logging:
 
-2. **Plan Generation**
-   - Implement `PlannerAgent.build_plan` using existing LLM backend.
-   - Display plan in sidebar/chat without executing steps.
+| Event | Payload |
+|-------|---------|
+| `PlanStartedEvent` | plan_id, goal, steps |
+| `PlanStepUpdateEvent` | plan_id, step_id, old_status, new_status, notes |
+| `PlanDecisionEvent` | plan_id, decision_id, question, options |
+| `PlanCompletedEvent` | plan_id, final_status, summary |
 
-3. **Execution & Decisions**
-   - Implement `SubAgentRunner`.
-   - Handle decision prompts + `/plan decide`.
-   - Update UI in real time; integrate with session memory.
+## Execution Flow
 
-4. **Polish**
-- Persist plan state across reloads/saves.
-- Add tests (unit for planner logic, snapshot for UI).
-- Tie into logging/analytics.
+```
+/plan <goal>
+    │
+    ▼
+PlannerAgent.start_plan(goal)
+    ├─ LLM generates structured plan
+    └─ validate_dependencies() (DFS cycle check)
+    │
+    ▼
+Emit PlanStartedEvent
+    │
+    ▼
+Start plan executor (background worker)
+    │
+    ▼
+┌─────────────────────────────────────┐
+│  Main Execution Loop                │
+│  ─────────────────────────────────  │
+│  1. get_parallel_runnable_steps()   │
+│  2. Filter decision-blocked steps   │
+│  3. For each executable step:       │
+│     - Create SubAgentConfig         │
+│     - SubAgent.execute(prompt)      │
+│     - Update step status            │
+│     - Emit PlanStepUpdateEvent      │
+│  4. Loop until all steps complete   │
+└─────────────────────────────────────┘
+    │
+    ▼
+Emit PlanCompletedEvent
+```
 
-## Persistence & Resume
+## Roadmap
 
-- Plan state serializes to a per-workspace file under `~/.vibe/plans/<slug>.json` whenever the planner mutates; the directory is created on demand.
-- Each workspace gets its own slugged file name where `<slug>` hashes the repo path so multiple projects never collide. The payload records the owning instance id + PID so we skip adopting plans that belong to other running CLIs.
-- On app startup we attempt to load this file, ignore corrupt JSON, and resume execution automatically if the stored plan was `ACTIVE`.
-- Snapshot tests stub `_load_plan_state()` to avoid touching the user filesystem.
-- Future config can expose a toggle (e.g., `planner.enable_persistence`) so advanced users can opt out of disk writes entirely.
+### Implemented
 
-## Open Questions
+- [x] PlannerAgent with goal decomposition
+- [x] Dependency validation (circular, missing, self-refs)
+- [x] SubAgent isolated execution
+- [x] Mode-aware system prompts
+- [x] Decision checkpoints with multi-select
+- [x] Parallel step execution
+- [x] Plan persistence infrastructure
+- [x] All `/plan` commands
+- [x] UI widgets (plan panel, ticker)
+- [x] Event system for UI updates
+- [x] Context budget management for planner (token tracking with warning thresholds)
+- [x] Rate-limit handling with exponential backoff and jitter
+- [x] Decision timeout mechanism with configurable timeout
+- [x] Plan export to session logs (`export_for_logging()`)
+- [x] Resource warning events (PlanResourceWarningEvent)
+- [x] Plan completion events (PlanCompletedEvent)
+- [x] Auto-compaction trigger when context budget is critical (95%+)
+- [x] Specialized subagent types (CodeSpecialist, TestSpecialist, ResearchSpecialist, etc.)
+- [x] Plan scheduling/queuing with priority and dependency support
 
-- Should planner support parallel execution? (recommended to defer until sequential MVP is stable.)
-- How to handle planner restarts after Vibe restarts? (Plan to serialize `PlanState` into history.)
-- How to expose planner steps in transcripts/log exports? (Need log schema update.)
-- How aggressive should context trimming be vs. auto-compaction? (Need heuristics.)
-- What retry budgets should apply when upstream rate limits are hit repeatedly?
-- How to surface rate-limit stalls to the user without spamming notifications?
+### Planned
 
-## Next Steps
+- [ ] UI integration for plan scheduler commands
+- [ ] Multi-plan workflow templates
+- [ ] Plan analytics and reporting
 
-- Validate this plan with stakeholders.
-- Once approved, implement Phase 1 (data structures + commands + basic UI toggle) before enabling execution.
+## Troubleshooting
+
+### Plan stuck on "Needs Decision"
+
+Check `/plan status` for pending decisions and respond with `/plan decide <id> <choice>`.
+
+### Steps not executing in parallel
+
+Steps only run in parallel when they have no mutual dependencies. Check the `depends_on` field in `/plan status`.
+
+### Context limit warnings
+
+If you see context warnings, the planner may be hitting token limits. Consider:
+1. Breaking the goal into smaller sub-goals
+2. Increasing `max_context_tokens` in config
+3. Using `/plan cancel` and starting fresh
+
+### Plan not resuming after restart
+
+Ensure the plan was saved (check `~/.vibe/plans/`). Plans from different Vibe instances won't be adopted to avoid conflicts.

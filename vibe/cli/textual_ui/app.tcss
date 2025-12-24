@@ -16,8 +16,9 @@ Screen {
 }
 
 #sidebar {
-    width: 24;
-    min-width: 20;
+    width: 32;
+    min-width: 28;
+    max-width: 40;
     height: 1fr;
     padding: 1;
     background: $background-darken-2;
@@ -88,6 +89,115 @@ Screen {
     text-align: left;
 }
 
+/* Claude Code-style Decision Form */
+.plan-decision-form {
+    border: round $foreground-muted;
+    padding: 1;
+    margin: 1 0;
+    background: $surface;
+}
+
+.decision-form-container {
+    width: 100%;
+}
+
+.decision-header-chip {
+    background: $primary;
+    color: $text;
+    padding: 0 1;
+    margin-bottom: 1;
+    width: auto;
+    max-width: 24;
+    text-style: bold;
+}
+
+.decision-question {
+    margin-bottom: 1;
+    text-style: bold;
+    color: $text;
+}
+
+.decision-options {
+    margin-bottom: 1;
+}
+
+/* Option Card Styling */
+.decision-option-card {
+    border: round $surface-lighten-1;
+    padding: 1;
+    margin-bottom: 1;
+    background: $background;
+    width: 100%;
+}
+
+.decision-option-card:hover {
+    border: round $primary;
+    background: $surface-lighten-1;
+}
+
+.decision-option-card.selected {
+    border: round $primary;
+    background: $primary 15%;
+}
+
+.option-card-row {
+    width: 100%;
+}
+
+.option-indicator {
+    width: 3;
+    color: $primary;
+    text-style: bold;
+}
+
+.option-content {
+    width: 1fr;
+}
+
+.option-label {
+    text-style: bold;
+    color: $text;
+}
+
+.option-description {
+    color: $text-muted;
+    margin-top: 0;
+}
+
+/* Other Option Container */
+.other-option-container {
+    width: 100%;
+}
+
+.other-option-input {
+    width: 100%;
+    background: $background;
+    border: round $foreground-muted;
+    color: $text;
+    padding: 0 1;
+    margin-top: 1;
+    margin-left: 3;
+}
+
+.other-option-input:focus {
+    border: round $primary;
+}
+
+/* Confirm Button */
+.decision-confirm-btn {
+    width: auto;
+    margin-top: 1;
+    dock: right;
+}
+
+/* Resolved State */
+.decision-resolved-status {
+    color: $success;
+    text-style: bold;
+    padding: 1;
+}
+
+/* Legacy Styles - Keep for backward compat */
 .plan-decision-update {
     border-left: solid $primary;
     padding-left: 1;
@@ -833,4 +943,260 @@ ContextProgress {
     padding: 0;
     margin: 0;
     color: $foreground;
+}
+
+/* ============================================
+   Enhanced Sidebar Styles
+   ============================================ */
+
+.enhanced-sidebar {
+    width: 100%;
+    height: 100%;
+    layout: vertical;
+}
+
+.sidebar-container {
+    width: 100%;
+    height: 100%;
+    layout: vertical;
+}
+
+.sidebar-separator {
+    height: 1;
+    width: 100%;
+    background: $foreground-muted;
+    margin: 1 0;
+}
+
+.sidebar-help {
+    color: $text-muted;
+    padding: 1 0 0 0;
+    height: auto;
+}
+
+/* Collapsible Section Styles */
+.collapsible-section {
+    width: 100%;
+    layout: vertical;
+}
+
+.section-header {
+    width: 100%;
+    color: $text;
+    text-style: bold;
+    padding: 0 0 1 0;
+    background: transparent;
+}
+
+.section-header:hover {
+    color: $primary;
+}
+
+.section-content {
+    width: 100%;
+    layout: vertical;
+}
+
+.section-tip {
+    color: $text-muted;
+    padding: 0 0 1 0;
+    height: auto;
+}
+
+/* Plan Panel Styles */
+.plan-panel {
+    width: 100%;
+    layout: vertical;
+}
+
+.plan-panel-container {
+    width: 100%;
+    layout: vertical;
+}
+
+#plan-panel-header {
+    width: 100%;
+    color: $text;
+    text-style: bold;
+    padding: 0 0 1 0;
+}
+
+#plan-content {
+    width: 100%;
+    layout: vertical;
+}
+
+.plan-goal {
+    width: 100%;
+    padding: 0 0 1 0;
+    color: $text;
+}
+
+.plan-progress {
+    width: 100%;
+    padding: 0 0 1 0;
+    color: $primary;
+}
+
+#plan-steps-scroll {
+    height: auto;
+    max-height: 15;
+    width: 100%;
+}
+
+#plan-steps-list {
+    width: 100%;
+    layout: vertical;
+}
+
+.no-plan-message {
+    color: $text-muted;
+    padding: 1 0;
+}
+
+/* Plan Step Item Styles */
+.plan-step-item {
+    width: 100%;
+    padding: 0 0 0 1;
+    height: auto;
+}
+
+.plan-step-item:hover {
+    background: $surface-lighten-1;
+}
+
+.plan-step-item.active-step {
+    background: $primary 15%;
+    border-left: solid $primary;
+}
+
+.plan-step-item.step-completed {
+    color: $success;
+}
+
+.plan-step-item.step-in_progress {
+    color: $warning;
+}
+
+.plan-step-item.step-blocked {
+    color: $error;
+}
+
+.plan-step-item.step-needs_decision {
+    color: $primary;
+}
+
+.plan-step-item.step-pending {
+    color: $text-muted;
+}
+
+.step-content {
+    width: 100%;
+}
+
+/* Subagent Indicator Styles */
+.subagent-indicator {
+    width: 100%;
+    padding: 1 0;
+    background: $warning 10%;
+    border-left: solid $warning;
+    margin-bottom: 1;
+}
+
+#indicator-content {
+    width: 100%;
+    color: $warning;
+}
+
+/* Todo Section Styles */
+.todo-scroll {
+    height: 1fr;
+    width: 100%;
+    min-height: 5;
+}
+
+#todo-items {
+    width: 100%;
+    layout: vertical;
+}
+
+.todo-placeholder {
+    color: $text-muted;
+    padding: 1 0;
+}
+
+/* Enhanced Todo Panel Styles */
+.todo-panel {
+    width: 100%;
+    layout: vertical;
+}
+
+.todo-panel-container {
+    width: 100%;
+    layout: vertical;
+}
+
+.todo-summary {
+    width: 100%;
+    padding: 0 0 1 0;
+    color: $text;
+}
+
+.todo-filter-hint {
+    color: $text-muted;
+    padding: 0 0 1 0;
+}
+
+.todo-filter-hint:hover {
+    background: $surface-lighten-1;
+}
+
+.todo-list-scroll {
+    height: 1fr;
+    width: 100%;
+    min-height: 3;
+    max-height: 20;
+}
+
+#todo-list {
+    width: 100%;
+    layout: vertical;
+}
+
+.todo-empty {
+    color: $text-muted;
+    padding: 1 0;
+}
+
+/* Todo Item Widget Styles */
+.todo-item-widget {
+    width: 100%;
+    padding: 0 0 0 1;
+    height: auto;
+}
+
+.todo-item-widget:hover {
+    background: $surface-lighten-1;
+}
+
+.todo-item-widget.todo-completed {
+    color: $success;
+}
+
+.todo-item-widget.todo-in_progress {
+    color: $warning;
+    background: $warning 10%;
+}
+
+.todo-item-widget.todo-cancelled {
+    color: $error;
+    text-style: strike;
+}
+
+.todo-item-widget.todo-pending {
+    color: $text-muted;
+}
+
+.todo-content {
+    width: 100%;
 }

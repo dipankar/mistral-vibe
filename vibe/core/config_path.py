@@ -40,6 +40,7 @@ GLOBAL_CONFIG_FILE = ConfigPath(lambda: VIBE_HOME.path / "config.toml")
 GLOBAL_ENV_FILE = ConfigPath(lambda: VIBE_HOME.path / ".env")
 GLOBAL_TOOLS_DIR = ConfigPath(lambda: VIBE_HOME.path / "tools")
 SESSION_LOG_DIR = ConfigPath(lambda: VIBE_HOME.path / "logs" / "session")
+SESSION_LOCK_FILE = ConfigPath(lambda: VIBE_HOME.path / ".session.lock")
 
 CONFIG_FILE = ConfigPath(_resolve_config_file)
 CONFIG_DIR = ConfigPath(lambda: CONFIG_FILE.path.parent)

@@ -94,7 +94,7 @@ class InteractionLogger:
     def _get_username(self) -> str:
         try:
             return getpass.getuser()
-        except Exception:
+        except (KeyError, OSError):
             return "unknown"
 
     def _initialize_session_metadata(self) -> SessionMetadata:
@@ -159,7 +159,7 @@ class InteractionLogger:
                 await f.write(json_content)
 
             return str(self.filepath)
-        except Exception:
+        except (OSError, TypeError, ValueError):
             return None
 
     def reset_session(self, session_id: str) -> None:

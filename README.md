@@ -66,6 +66,10 @@ pip install mistral-vibe
   - Autocompletion for slash commands (`/`) and file paths (`@`).
   - Persistent command history.
   - Beautiful Themes.
+- **Session Management**: Seamless session continuity and safety.
+  - Resume previous sessions with `-c` or `--continue` flag.
+  - Prompted to resume on startup if a recent session exists.
+  - Single-session locking prevents conflicts from multiple instances.
 - **Highly Configurable**: Customize models, providers, tool permissions, and UI preferences through a simple `config.toml` file.
 - **Safety First**: Features tool execution approval.
 
@@ -118,6 +122,19 @@ You can start Vibe with a prompt with the following command:
 ```bash
 vibe "Refactor the main function in cli/main.py to be more modular."
 ```
+
+**Session Continuation**:
+
+```bash
+# Continue the most recent session
+vibe -c
+vibe --continue
+
+# Resume a specific session by ID (supports partial matching)
+vibe --resume abc123
+```
+
+When starting Vibe, if a previous session exists you'll be prompted to resume it.
 
 **Note**: The `--auto-approve` flag automatically approves all tool executions without prompting. In interactive mode, you can also toggle auto-approve on/off using `Shift+Tab`.
 

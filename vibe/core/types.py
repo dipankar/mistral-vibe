@@ -221,6 +221,10 @@ class BaseEvent(BaseModel, ABC):
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
+    # Optional subagent context for events from parallel step execution
+    subagent_id: str | None = None
+    subagent_step_id: str | None = None
+
 
 class AssistantEvent(BaseEvent):
     content: str
@@ -276,12 +280,44 @@ class PlanStepUpdateEvent(PlanEvent):
     mode: str | None = None
 
 
+class DecisionOptionData(BaseModel):
+    """Rich option with label and description for Claude Code-style forms."""
+    label: str
+    description: str = ""
+
+
 class PlanDecisionEvent(PlanEvent):
     decision_id: str
+    header: str = "Decision"  # Short chip label like "Database", "Auth Type"
     question: str
-    options: list[str] = Field(default_factory=list)
+    options: list[DecisionOptionData] = Field(default_factory=list)
+    multi_select: bool = False
     resolved: bool = False
-    selection: str | None = None
+    selections: list[str] = Field(default_factory=list)
+
+    @property
+    def selection(self) -> str | None:
+        """Backward compatibility: return first selection."""
+        return self.selections[0] if self.selections else None
+
+
+class PlanResourceWarningEvent(PlanEvent):
+    """Event emitted when planner resources are constrained."""
+
+    warning_type: str  # "budget", "rate_limit", "decision_timeout"
+    level: str  # "warning", "critical", "exceeded"
+    message: str
+    details: dict[str, str] = Field(default_factory=dict)
+
+
+class PlanCompletedEvent(PlanEvent):
+    """Event emitted when a plan completes."""
+
+    final_status: str  # "completed", "cancelled", "failed"
+    summary: str = ""
+    steps_completed: int = 0
+    steps_total: int = 0
+    resources_used: dict[str, str] = Field(default_factory=dict)
 
 
 class MemoryEntryEvent(BaseEvent):
