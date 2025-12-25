@@ -23,6 +23,7 @@ from vibe.cli.clipboard import copy_selection_to_clipboard
 from vibe.cli.commands import CommandRegistry
 from vibe.cli.textual_ui.consumers.textual_consumer import TextualEventConsumer
 from vibe.cli.textual_ui.ui_state import UIState
+from vibe.core.dispatchers import EventDispatcher
 from vibe.cli.textual_ui.widgets.approval_app import ApprovalApp
 from vibe.cli.textual_ui.widgets.chat_input import ChatInputContainer
 from vibe.cli.textual_ui.widgets.compact import CompactMessage
@@ -149,6 +150,7 @@ class VibeApp(App):
         self._pending_approval: asyncio.Future | None = None
 
         self.event_handler: TextualEventConsumer | None = None
+        self._event_dispatcher: EventDispatcher | None = None
         self._ui_state: UIState | None = None
         self.commands = CommandRegistry()
 
@@ -390,9 +392,11 @@ class VibeApp(App):
         # Get reference to enhanced sidebar
         self._sidebar = self.query_one(Sidebar)
 
-        # Initialize UI state and event consumer
+        # Initialize UI state, event dispatcher, and consumer
         self._ui_state = UIState(self)
+        self._event_dispatcher = EventDispatcher()
         self.event_handler = TextualEventConsumer(self)
+        self._event_dispatcher.add_consumer(self.event_handler)
 
         self._chat_input_container = self.query_one(ChatInputContainer)
         self._mode_indicator = self.query_one(ModeIndicator)
@@ -1070,12 +1074,11 @@ class VibeApp(App):
                         )
                     )
 
-                if self.event_handler:
-                    await self.event_handler.handle_event(
-                        event,
-                        loading_active=self._loading_widget is not None,
-                        loading_widget=self._loading_widget,
-                    )
+                # Dispatch event to all registered consumers
+                if self._event_dispatcher:
+                    await self._event_dispatcher.dispatch(event)
+
+                # Additional app-level event handling
                 if isinstance(event, MemoryEntryEvent):
                     await self._refresh_memory_panel()
                 elif isinstance(event, CompactEndEvent):
@@ -2029,6 +2032,27 @@ class VibeApp(App):
         """Handle memory panel refresh (ITextualApp interface)."""
         await self._refresh_memory_panel()
 
+    # Event dispatcher consumer management
+
+    def add_event_consumer(self, consumer: Any) -> None:
+        """Add an external event consumer to receive agent events.
+
+        Enables Web API, logging, or other external consumers to
+        receive events from the agent.
+        """
+        if self._event_dispatcher:
+            self._event_dispatcher.add_consumer(consumer)
+
+    def remove_event_consumer(self, consumer: Any) -> None:
+        """Remove an event consumer."""
+        if self._event_dispatcher:
+            self._event_dispatcher.remove_consumer(consumer)
+
+    @property
+    def event_dispatcher(self) -> EventDispatcher | None:
+        """Access to the event dispatcher for advanced use cases."""
+        return self._event_dispatcher
+
     def _anchor_if_scrollable(self) -> None:
         if not self._auto_scroll:
             return
@@ -2476,13 +2500,9 @@ class VibeApp(App):
 
         try:
             async for event in subagent.execute(prompt):
-                # Handle events similar to main agent
-                if self.event_handler:
-                    await self.event_handler.handle_event(
-                        event,
-                        loading_active=self._loading_widget is not None,
-                        loading_widget=self._loading_widget,
-                    )
+                # Dispatch events to all registered consumers
+                if self._event_dispatcher:
+                    await self._event_dispatcher.dispatch(event)
         finally:
             if self._loading_widget and self._loading_widget.parent:
                 await self._loading_widget.remove()
