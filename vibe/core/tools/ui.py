@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
-    from vibe.core.types import ToolCallEvent, ToolResultEvent
+    from vibe.core.types import ToolCallEvent, ToolDisplayDestination, ToolResultEvent
 
 
 class ToolCallDisplay(BaseModel):
@@ -31,6 +31,15 @@ class ToolUIData[TArgs: BaseModel, TResult: BaseModel](Protocol):
 
     @classmethod
     def get_status_text(cls) -> str: ...
+
+    @classmethod
+    def get_display_destination(cls) -> ToolDisplayDestination:
+        """Return where this tool's results should be displayed.
+
+        Override in tools that should display in sidebar (e.g., todo).
+        Default is CHAT (main messages area).
+        """
+        ...
 
 
 class ToolUIDataAdapter:
@@ -78,3 +87,11 @@ class ToolUIDataAdapter:
 
         tool_name = getattr(self.tool_class, "get_name", lambda: "tool")()
         return f"Running {tool_name}"
+
+    def get_display_destination(self) -> ToolDisplayDestination:
+        from vibe.core.types import ToolDisplayDestination
+
+        if self.ui_data_class and hasattr(self.ui_data_class, "get_display_destination"):
+            return self.ui_data_class.get_display_destination()
+
+        return ToolDisplayDestination.CHAT

@@ -108,6 +108,11 @@ class CommandRegistry:
                 handler="_toggle_thinking_mode",
                 accepts_argument=True,
             ),
+            "retry": Command(
+                aliases=frozenset(["/retry", "/again"]),
+                description="Retry the last failed operation",
+                handler="_retry_last_prompt",
+            ),
         }
 
         for command in excluded_commands:

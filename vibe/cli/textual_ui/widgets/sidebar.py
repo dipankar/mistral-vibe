@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from textual.app import ComposeResult
 from textual.containers import Vertical, VerticalScroll
+from textual.css.query import QueryError
 from textual.message import Message
 from textual.reactive import reactive
 from textual.widgets import Static
@@ -57,7 +58,8 @@ class CollapsibleSection(Static):
             icon = "▶" if collapsed else "▼"
             header.update(f"{icon} {self._title}")
             content.display = not collapsed
-        except Exception:
+        except QueryError:
+            # Widget not yet mounted
             pass
 
     async def on_click(self, event) -> None:
@@ -69,7 +71,8 @@ class CollapsibleSection(Static):
                 self.collapsed = not self.collapsed
                 self.post_message(self.Toggled(self._section_id, self.collapsed))
                 event.stop()
-        except Exception:
+        except QueryError:
+            # Widget not yet mounted
             pass
 
 
@@ -90,7 +93,7 @@ class TodoSection(CollapsibleSection):
         if self._todo_panel:
             try:
                 return self._todo_panel.query_one("#todo-list", Vertical)
-            except Exception:
+            except QueryError:
                 return None
         return None
 
@@ -120,6 +123,11 @@ class PlanSection(CollapsibleSection):
     def update_plan(self, plan: PlanState | None) -> None:
         if self._plan_panel:
             self._plan_panel.update_plan(plan)
+
+    def clear_plan(self) -> None:
+        """Explicitly clear the plan panel and invalidate pending updates."""
+        if self._plan_panel:
+            self._plan_panel.clear()
 
     def update_step(self, step_id: str, step: PlanStep) -> None:
         if self._plan_panel:
@@ -178,6 +186,11 @@ class Sidebar(Static):
     def update_plan(self, plan: PlanState | None) -> None:
         if self._plan_section:
             self._plan_section.update_plan(plan)
+
+    def clear_plan(self) -> None:
+        """Explicitly clear the plan panel and invalidate pending updates."""
+        if self._plan_section:
+            self._plan_section.clear_plan()
 
     def update_step(self, step_id: str, step: PlanStep) -> None:
         if self._plan_section:

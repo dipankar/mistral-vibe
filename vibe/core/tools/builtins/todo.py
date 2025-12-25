@@ -13,7 +13,7 @@ from vibe.core.tools.base import (
     ToolPermission,
 )
 from vibe.core.tools.ui import ToolCallDisplay, ToolResultDisplay, ToolUIData
-from vibe.core.types import ToolCallEvent, ToolResultEvent
+from vibe.core.types import ToolCallEvent, ToolDisplayDestination, ToolResultEvent
 
 
 class TodoStatus(StrEnum):
@@ -111,6 +111,10 @@ class Todo(
     @classmethod
     def get_status_text(cls) -> str:
         return "Managing todos"
+
+    @classmethod
+    def get_display_destination(cls) -> ToolDisplayDestination:
+        return ToolDisplayDestination.SIDEBAR
 
     async def run(self, args: TodoArgs) -> TodoResult:
         match args.action:

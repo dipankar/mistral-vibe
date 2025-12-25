@@ -1090,22 +1090,64 @@ ContextProgress {
     color: $text-muted;
 }
 
-.step-content {
-    width: 100%;
-}
-
 /* Subagent Indicator Styles */
 .subagent-indicator {
     width: 100%;
-    padding: 1 0;
+    padding: 0 1;
     background: $warning 10%;
     border-left: solid $warning;
     margin-bottom: 1;
 }
 
-#indicator-content {
+.indicator-container {
+    width: 100%;
+    layout: vertical;
+}
+
+.indicator-progress {
+    width: 100%;
+    color: $text;
+    text-style: bold;
+}
+
+.indicator-content {
     width: 100%;
     color: $warning;
+}
+
+.indicator-timer {
+    width: 100%;
+    color: $warning;
+}
+
+/* Step Row Styles */
+.step-row {
+    width: 100%;
+    layout: horizontal;
+}
+
+.step-content {
+    width: 1fr;
+}
+
+.step-duration {
+    width: auto;
+    text-align: right;
+    padding-right: 1;
+}
+
+/* Execution Summary Styles */
+.execution-summary {
+    width: 100%;
+    padding: 1 0;
+    border-top: solid $foreground-muted;
+    margin-top: 1;
+}
+
+.summary-content {
+    width: 100%;
+    color: $text-muted;
+    text-align: center;
 }
 
 /* Todo Section Styles */

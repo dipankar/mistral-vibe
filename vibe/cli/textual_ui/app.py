@@ -6,7 +6,7 @@ import hashlib
 import os
 import re
 import subprocess
-from typing import Any, ClassVar, assert_never
+from typing import Any, Callable, ClassVar, Coroutine, assert_never
 
 import json
 from pathlib import Path
@@ -17,11 +17,12 @@ from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widget import Widget
 from textual.widgets import Static
-from textual.worker import Worker
+from textual.worker import Worker, WorkerState
 
 from vibe.cli.clipboard import copy_selection_to_clipboard
 from vibe.cli.commands import CommandRegistry
-from vibe.cli.textual_ui.handlers.event_handler import EventHandler
+from vibe.cli.textual_ui.consumers.textual_consumer import TextualEventConsumer
+from vibe.cli.textual_ui.ui_state import UIState
 from vibe.cli.textual_ui.widgets.approval_app import ApprovalApp
 from vibe.cli.textual_ui.widgets.chat_input import ChatInputContainer
 from vibe.cli.textual_ui.widgets.compact import CompactMessage
@@ -147,7 +148,8 @@ class VibeApp(App):
         self._loading_widget: LoadingWidget | None = None
         self._pending_approval: asyncio.Future | None = None
 
-        self.event_handler: EventHandler | None = None
+        self.event_handler: TextualEventConsumer | None = None
+        self._ui_state: UIState | None = None
         self.commands = CommandRegistry()
 
         self._chat_input_container: ChatInputContainer | None = None
@@ -192,6 +194,162 @@ class VibeApp(App):
         self._rate_limit_reset_task: asyncio.Task | None = None
         self._sidebar: Sidebar | None = None
 
+        # Event-based signaling for responsiveness (initialized lazily)
+        self._agent_idle_event: asyncio.Event | None = None
+        # Use Condition instead of Event to prevent missed signals
+        self._step_update_condition: asyncio.Condition | None = None
+        self._step_update_pending: bool = False  # Flag to track pending updates
+
+        # Lock for protecting agent state transitions
+        self._agent_state_lock: asyncio.Lock | None = None
+
+        # Retry state for agent failures
+        self._last_failed_prompt: str | None = None
+        self._retry_count: int = 0
+        self._max_retries: int = 3
+        self._retry_delay_base: float = 1.0  # seconds, exponential backoff
+
+    def _ensure_events(self) -> None:
+        """Ensure event objects and locks are created (must be called from async context)."""
+        if self._agent_idle_event is None:
+            self._agent_idle_event = asyncio.Event()
+            self._agent_idle_event.set()  # Start in idle state
+        if self._step_update_condition is None:
+            self._step_update_condition = asyncio.Condition()
+        if self._agent_state_lock is None:
+            self._agent_state_lock = asyncio.Lock()
+
+    def _signal_agent_busy(self) -> None:
+        """Signal that the agent has started working."""
+        if self._agent_idle_event:
+            self._agent_idle_event.clear()
+
+    def _signal_agent_idle(self) -> None:
+        """Signal that the agent has become idle."""
+        if self._agent_idle_event:
+            self._agent_idle_event.set()
+
+    def _signal_step_update(self) -> None:
+        """Signal that a plan step status has changed."""
+        # Set pending flag and schedule async notification
+        self._step_update_pending = True
+        if self._step_update_condition:
+            # Schedule the async notification
+            self.call_later(self._notify_step_update)
+
+    async def _notify_step_update(self) -> None:
+        """Notify waiters that a step update occurred."""
+        if self._step_update_condition:
+            async with self._step_update_condition:
+                self._step_update_condition.notify_all()
+
+    def _is_retryable_error(self, error: Exception | str) -> bool:
+        """Check if an error is transient and worth retrying."""
+        error_str = str(error).lower()
+        retryable_patterns = [
+            "rate limit",
+            "too many requests",
+            "429",
+            "503",
+            "502",
+            "504",
+            "timeout",
+            "connection",
+            "network",
+            "temporarily unavailable",
+            "service unavailable",
+            "server error",
+            "internal error",
+        ]
+        return any(pattern in error_str for pattern in retryable_patterns)
+
+    def _get_retry_delay(self) -> float:
+        """Calculate exponential backoff delay for retry."""
+        # Exponential backoff with jitter: base * 2^retry_count + random jitter
+        import random
+        delay = self._retry_delay_base * (2 ** self._retry_count)
+        jitter = random.uniform(0, delay * 0.1)  # 10% jitter
+        return min(delay + jitter, 30.0)  # Cap at 30 seconds
+
+    def _reset_retry_state(self) -> None:
+        """Reset retry state after successful operation."""
+        self._last_failed_prompt = None
+        self._retry_count = 0
+
+    async def _retry_last_prompt(self) -> None:
+        """Retry the last failed prompt with exponential backoff."""
+        if not self._last_failed_prompt:
+            await self._mount_and_scroll(
+                UserCommandMessage("No failed operation to retry.")
+            )
+            return
+
+        if self._retry_count >= self._max_retries:
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    f"Max retries ({self._max_retries}) exceeded. Please try again later.",
+                    collapsed=self._tools_collapsed,
+                )
+            )
+            self._reset_retry_state()
+            return
+
+        delay = self._get_retry_delay()
+        self._retry_count += 1
+
+        await self._mount_and_scroll(
+            UserCommandMessage(
+                f"Retrying (attempt {self._retry_count}/{self._max_retries}) "
+                f"after {delay:.1f}s delay..."
+            )
+        )
+
+        await asyncio.sleep(delay)
+
+        # Re-run the failed prompt
+        prompt = self._last_failed_prompt
+        self._last_failed_prompt = None  # Clear before retry
+
+        if self.agent and not self._agent_running:
+            self._agent_task = self._create_safe_task(
+                self._handle_agent_turn(prompt),
+                name="agent-turn-retry",
+            )
+
+    def _create_safe_task(
+        self,
+        coro: Coroutine,
+        *,
+        name: str | None = None,
+        error_callback: Callable[[Exception], None] | None = None,
+    ) -> asyncio.Task:
+        """Create an asyncio task with error boundary.
+
+        Unhandled exceptions are logged and optionally passed to a callback.
+        This prevents "Task exception was never retrieved" warnings.
+        """
+        task = asyncio.create_task(coro, name=name)
+
+        def _handle_task_exception(t: asyncio.Task) -> None:
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc:
+                logger.error(
+                    "Unhandled exception in task %s: %s",
+                    name or "unnamed",
+                    exc,
+                    exc_info=exc,
+                )
+                if error_callback:
+                    try:
+                        error_callback(exc)
+                    except Exception:
+                        pass
+
+        task.add_done_callback(_handle_task_exception)
+        return task
+
     def compose(self) -> ComposeResult:
         with Horizontal(id="app-layout"):
             with Vertical(id="main-root"):
@@ -226,16 +384,15 @@ class VibeApp(App):
 
 
     async def on_mount(self) -> None:
+        # Initialize event-based signaling
+        self._ensure_events()
+
         # Get reference to enhanced sidebar
         self._sidebar = self.query_one(Sidebar)
 
-        self.event_handler = EventHandler(
-            mount_callback=self._mount_and_scroll,
-            scroll_callback=self._scroll_to_bottom_deferred,
-            todo_area_callback=lambda: self._sidebar.get_todo_container() if self._sidebar else None,
-            get_tools_collapsed=lambda: self._tools_collapsed,
-            get_todos_collapsed=lambda: self._todos_collapsed,
-        )
+        # Initialize UI state and event consumer
+        self._ui_state = UIState(self)
+        self.event_handler = TextualEventConsumer(self)
 
         self._chat_input_container = self.query_one(ChatInputContainer)
         self._mode_indicator = self.query_one(ModeIndicator)
@@ -375,8 +532,9 @@ class VibeApp(App):
         self._update_planner_ticker()
         if self._rate_limit_reset_task:
             self._rate_limit_reset_task.cancel()
-        self._rate_limit_reset_task = asyncio.create_task(
-            self._clear_rate_limit_alert()
+        self._rate_limit_reset_task = self._create_safe_task(
+            self._clear_rate_limit_alert(),
+            name="rate-limit-reset",
         )
 
     async def _clear_rate_limit_alert(self, delay: float = 12.0) -> None:
@@ -582,6 +740,36 @@ class VibeApp(App):
 
         await self._switch_to_input_app()
 
+    def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
+        """Handle worker state changes to propagate errors to UI."""
+        if event.state == WorkerState.ERROR:
+            worker = event.worker
+            error = worker.error
+            worker_name = worker.name or "background task"
+
+            # Log the error
+            logger.error(
+                "Worker '%s' failed with error: %s",
+                worker_name,
+                error,
+                exc_info=error,
+            )
+
+            # Show error in UI (schedule to avoid blocking)
+            async def _show_worker_error() -> None:
+                error_msg = str(error) if error else "Unknown error"
+                await self._mount_and_scroll(
+                    ErrorMessage(
+                        f"Background task '{worker_name}' failed: {error_msg}",
+                        collapsed=self._tools_collapsed,
+                    )
+                )
+                # If it's a rate limit error, trigger the alert
+                if error and self._looks_like_rate_limit_error(str(error)):
+                    self._trigger_rate_limit_alert()
+
+            self.call_later(_show_worker_error)
+
     def _set_tool_permission_always(
         self, tool_name: str, save_permanently: bool = False
     ) -> None:
@@ -637,8 +825,9 @@ class VibeApp(App):
             )
             return
 
-        try:
-            result = subprocess.run(
+        def _run_subprocess() -> subprocess.CompletedProcess:
+            """Run subprocess in a thread to avoid blocking the event loop."""
+            return subprocess.run(
                 command,
                 shell=True,
                 capture_output=True,
@@ -646,6 +835,10 @@ class VibeApp(App):
                 timeout=30,
                 cwd=self.config.effective_workdir,
             )
+
+        try:
+            # Run subprocess in a thread pool to keep UI responsive
+            result = await asyncio.to_thread(_run_subprocess)
             stdout = (
                 result.stdout.decode("utf-8", errors="replace") if result.stdout else ""
             )
@@ -733,8 +926,9 @@ class VibeApp(App):
                 return
 
             if self.agent and not self._agent_running:
-                self._agent_task = asyncio.create_task(
-                    self._handle_agent_turn(agent_prompt)
+                self._agent_task = self._create_safe_task(
+                    self._handle_agent_turn(agent_prompt),
+                    name="agent-turn",
                 )
         except asyncio.CancelledError:
             self._agent_init_interrupted = False
@@ -747,37 +941,70 @@ class VibeApp(App):
             return
 
         self._agent_initializing = True
+        # Timeout for agent initialization (30 seconds should be plenty)
+        AGENT_INIT_TIMEOUT = 30.0
+
         try:
-            agent = Agent(
-                self.config,
-                auto_approve=self.auto_approve,
-                enable_streaming=self.enable_streaming,
-            )
-
-            if not self.auto_approve:
-                agent.approval_callback = self._approval_callback
-
-            if self._loaded_messages:
-                non_system_messages = [
-                    msg
-                    for msg in self._loaded_messages
-                    if not (msg.role == Role.system)
-                ]
-                agent.messages.extend(non_system_messages)
-                logger.info(
-                    "Loaded %d messages from previous session", len(non_system_messages)
+            async with asyncio.timeout(AGENT_INIT_TIMEOUT):
+                # Run potentially blocking Agent creation in a thread
+                agent = await asyncio.to_thread(
+                    Agent,
+                    self.config,
+                    auto_approve=self.auto_approve,
+                    enable_streaming=self.enable_streaming,
                 )
 
-            self.agent = agent
-            await self._refresh_memory_panel()
+                if not self.auto_approve:
+                    agent.approval_callback = self._approval_callback
+
+                if self._loaded_messages:
+                    non_system_messages = [
+                        msg
+                        for msg in self._loaded_messages
+                        if not (msg.role == Role.system)
+                    ]
+                    agent.messages.extend(non_system_messages)
+                    logger.info(
+                        "Loaded %d messages from previous session", len(non_system_messages)
+                    )
+
+                self.agent = agent
+                await self._refresh_memory_panel()
+        except asyncio.TimeoutError:
+            self.agent = None
+            error_msg = (
+                f"Agent initialization timed out after {AGENT_INIT_TIMEOUT}s. "
+                "Please check your network connection and API configuration."
+            )
+            await self._mount_and_scroll(
+                ErrorMessage(error_msg, collapsed=self._tools_collapsed)
+            )
+            # Timeout is retryable
+            await self._mount_and_scroll(
+                UserCommandMessage(
+                    "Use `/retry` to retry initialization, or the agent will "
+                    "retry automatically on your next message."
+                )
+            )
         except asyncio.CancelledError:
             self.agent = None
             return
         except Exception as e:
             self.agent = None
+            error_str = str(e)
             await self._mount_and_scroll(
-                ErrorMessage(str(e), collapsed=self._tools_collapsed)
+                ErrorMessage(error_str, collapsed=self._tools_collapsed)
             )
+            # Offer retry for retryable errors
+            if self._is_retryable_error(e):
+                await self._mount_and_scroll(
+                    UserCommandMessage(
+                        "This error may be temporary. The agent will retry "
+                        "automatically on your next message, or use `/retry`."
+                    )
+                )
+                if self._looks_like_rate_limit_error(error_str):
+                    self._trigger_rate_limit_alert()
         finally:
             self._agent_initializing = False
             self._agent_init_task = None
@@ -794,7 +1021,10 @@ class VibeApp(App):
 
         if not self._agent_init_task or self._agent_init_task.done():
             self._agent_init_interrupted = False
-            self._agent_init_task = asyncio.create_task(self._initialize_agent())
+            self._agent_init_task = self._create_safe_task(
+                self._initialize_agent(),
+                name="agent-init",
+            )
 
         return self._agent_init_task
 
@@ -808,10 +1038,13 @@ class VibeApp(App):
         return result
 
     async def _handle_agent_turn(self, prompt: str) -> None:
-        if not self.agent:
+        # Capture agent reference to prevent race conditions during iteration
+        agent = self.agent
+        if not agent:
             return
 
         self._agent_running = True
+        self._signal_agent_busy()
 
         loading_area = self.query_one("#loading-area-content")
 
@@ -823,13 +1056,15 @@ class VibeApp(App):
             rendered_prompt = render_path_prompt(
                 prompt, base_dir=self.config.effective_workdir
             )
-            async for event in self.agent.act(rendered_prompt):
-                if self.agent:
+            # Use captured agent reference for iteration
+            async for event in agent.act(rendered_prompt):
+                # Check if agent is still valid (could be cleared during cancellation)
+                if self.agent is not None:
                     current_state = self._current_token_state
                     self._set_context_tokens(
                         TokenState(
                             max_tokens=current_state.max_tokens,
-                            current_tokens=self.agent.stats.context_tokens,
+                            current_tokens=agent.stats.context_tokens,
                             soft_limit_ratio=current_state.soft_limit_ratio
                             or self.config.memory_soft_limit_ratio,
                         )
@@ -857,11 +1092,36 @@ class VibeApp(App):
                 await self._loading_widget.remove()
             if self.event_handler:
                 self.event_handler.stop_current_tool_call()
+
+            error_str = str(e)
+            is_retryable = self._is_retryable_error(e)
+
+            # Store prompt for potential retry
+            if is_retryable:
+                self._last_failed_prompt = prompt
+
             await self._mount_and_scroll(
-                ErrorMessage(str(e), collapsed=self._tools_collapsed)
+                ErrorMessage(error_str, collapsed=self._tools_collapsed)
             )
-            if self._looks_like_rate_limit_error(str(e)):
+
+            if self._looks_like_rate_limit_error(error_str):
                 self._trigger_rate_limit_alert()
+
+            # Offer retry for retryable errors
+            if is_retryable and self._retry_count < self._max_retries:
+                await self._mount_and_scroll(
+                    UserCommandMessage(
+                        f"This error may be temporary. Use `/retry` to retry, "
+                        f"or wait for auto-retry in {self._get_retry_delay():.0f}s. "
+                        f"({self._retry_count + 1}/{self._max_retries} attempts remaining)"
+                    )
+                )
+                # Schedule auto-retry for rate limit errors
+                if self._looks_like_rate_limit_error(error_str):
+                    self.call_later(self._retry_last_prompt)
+        else:
+            # Success - reset retry state
+            self._reset_retry_state()
         finally:
             self._agent_running = False
             self._interrupt_requested = False
@@ -870,8 +1130,18 @@ class VibeApp(App):
                 await self._loading_widget.remove()
             self._loading_widget = None
             await self._finalize_current_streaming_message()
+            self._signal_agent_idle()
 
     async def _interrupt_agent(self) -> None:
+        # Use lock to prevent race conditions during state transitions
+        if self._agent_state_lock:
+            async with self._agent_state_lock:
+                await self._interrupt_agent_impl()
+        else:
+            await self._interrupt_agent_impl()
+
+    async def _interrupt_agent_impl(self) -> None:
+        """Implementation of agent interrupt - called within state lock."""
         interrupting_agent_init = bool(
             self._agent_init_task and not self._agent_init_task.done()
         )
@@ -1044,6 +1314,9 @@ class VibeApp(App):
         self._planner_agent.cancel()
         await self._clear_plan_cards()
         self._cancel_plan_executor()
+        # Use clear_plan to invalidate any pending updates
+        if self._sidebar:
+            self._sidebar.clear_plan()
         await self._refresh_planner_panel(None)
         self._update_planner_ticker(None)
         await self._mount_and_scroll(UserCommandMessage("Planning session cancelled."))
@@ -1243,7 +1516,8 @@ class VibeApp(App):
 
     async def _reload_config(self) -> None:
         try:
-            new_config = VibeConfig.load()
+            # Run config loading in thread pool to avoid blocking on file I/O
+            new_config = await asyncio.to_thread(VibeConfig.load)
 
             if self.agent:
                 await self.agent.reload_with_initial_messages(config=new_config)
@@ -1290,6 +1564,8 @@ class VibeApp(App):
             await self.agent.clear_history()
             await self._refresh_memory_panel()
             await self._finalize_current_streaming_message()
+            if self.event_handler:
+                self.event_handler.reset()
             messages_area = self.query_one("#messages")
             await messages_area.remove_children()
             # Clear todos in sidebar
@@ -1704,6 +1980,55 @@ class VibeApp(App):
     def _scroll_to_bottom_deferred(self) -> None:
         self.call_after_refresh(self._scroll_to_bottom)
 
+    # ITextualApp interface methods for TextualEventConsumer
+
+    async def mount_to_chat(self, widget: Widget) -> None:
+        """Mount widget to chat/messages area (ITextualApp interface)."""
+        await self._mount_and_scroll(widget)
+
+    async def mount_to_sidebar(self, widget: Widget) -> None:
+        """Mount widget to sidebar area (ITextualApp interface)."""
+        if self._sidebar:
+            todo_area = self._sidebar.get_todo_container()
+            if todo_area:
+                await todo_area.remove_children()
+                await todo_area.mount(widget)
+
+    def get_loading_widget(self) -> LoadingWidget | None:
+        """Get current loading widget (ITextualApp interface)."""
+        return self._loading_widget
+
+    def get_ui_state(self) -> UIState:
+        """Get current UI state (ITextualApp interface)."""
+        if self._ui_state is None:
+            self._ui_state = UIState(self)
+        return self._ui_state
+
+    async def on_plan_started(self, event: Any) -> None:
+        """Handle plan started event (ITextualApp interface)."""
+        # Plan events are handled separately by the planner integration
+        pass
+
+    async def on_plan_step_update(self, event: Any) -> None:
+        """Handle plan step update (ITextualApp interface)."""
+        pass
+
+    async def on_plan_decision(self, event: Any) -> None:
+        """Handle plan decision (ITextualApp interface)."""
+        pass
+
+    async def on_plan_completed(self, event: Any) -> None:
+        """Handle plan completion (ITextualApp interface)."""
+        pass
+
+    async def on_plan_resource_warning(self, event: Any) -> None:
+        """Handle resource warning (ITextualApp interface)."""
+        pass
+
+    async def on_memory_updated(self) -> None:
+        """Handle memory panel refresh (ITextualApp interface)."""
+        await self._refresh_memory_panel()
+
     def _anchor_if_scrollable(self) -> None:
         if not self._auto_scroll:
             return
@@ -1723,8 +2048,9 @@ class VibeApp(App):
         ):
             return
 
-        self._update_notification_task = asyncio.create_task(
-            self._check_version_update(), name="version-update-check"
+        self._update_notification_task = self._create_safe_task(
+            self._check_version_update(),
+            name="version-update-check",
         )
 
     async def _check_version_update(self) -> None:
@@ -1802,6 +2128,15 @@ class VibeApp(App):
     def action_copy_selection(self) -> None:
         copy_selection_to_clipboard(self)
 
+    def action_copy_text(self) -> None:
+        """Override Textual's default copy action to use our safe implementation.
+
+        Textual's built-in action_copy_text has a bug where Selection coordinates
+        are screen-relative but extraction expects widget-relative coordinates,
+        causing IndexError on multi-line layouts.
+        """
+        copy_selection_to_clipboard(self)
+
     def _ensure_planner(self) -> PlannerAgent:
         if not self._planner_agent:
             self._planner_agent = PlannerAgent(self.config)
@@ -1859,22 +2194,46 @@ class VibeApp(App):
         # Update sidebar plan panel
         if self._sidebar:
             self._sidebar.update_plan(plan)
-        self._persist_plan_state()
+        await self._persist_plan_state_async()
 
     def _start_plan_executor(self, plan_id: str) -> None:
+        # Cancel any existing executor first and wait for it
         self._cancel_plan_executor()
-        worker = self.run_worker(self._execute_plan_steps(plan_id), exclusive=False)
+        # Start new executor
+        worker = self.run_worker(
+            self._execute_plan_steps(plan_id),
+            exclusive=False,
+            name=f"plan-executor-{plan_id}",
+        )
         self._plan_executor_worker = worker
         self._plan_executor_plan_id = plan_id
 
     def _cancel_plan_executor(self) -> None:
-        if self._plan_executor_worker:
-            self._plan_executor_worker.cancel()
-        self._plan_executor_worker = None
-        self._plan_executor_plan_id = None
-        self._persist_plan_state()
+        worker = self._plan_executor_worker
+        if worker:
+            # Cancel the worker
+            worker.cancel()
+            # Clear references immediately to prevent new operations
+            self._plan_executor_worker = None
+            self._plan_executor_plan_id = None
+            # Log if worker didn't stop cleanly
+            if not worker.is_cancelled and not worker.is_finished:
+                logger.warning(
+                    "Plan executor worker %s still running after cancel",
+                    worker.name,
+                )
+        else:
+            self._plan_executor_worker = None
+            self._plan_executor_plan_id = None
+        # Schedule async persist without blocking
+        self.call_later(self._persist_plan_state_async)
 
-    def _persist_plan_state(self) -> None:
+    async def _persist_plan_state_async(self) -> None:
+        """Async version of plan state persistence - runs I/O in thread pool."""
+        await asyncio.to_thread(self._persist_plan_state_sync)
+
+    def _persist_plan_state_sync(self) -> None:
+        """Synchronous plan state persistence - called from thread pool."""
         plan_data = None
         if self._planner_agent:
             plan_data = self._planner_agent.to_dict()
@@ -1941,8 +2300,22 @@ class VibeApp(App):
                 if not in_progress and not parallel_steps:
                     await self._maybe_mark_plan_complete(plan_id)
                     return
-                # Wait for in-progress steps to complete
-                await asyncio.sleep(0.1)
+                # Wait for step update using Condition to prevent missed signals
+                if self._step_update_condition:
+                    async with self._step_update_condition:
+                        # Check if update already pending before waiting
+                        if not self._step_update_pending:
+                            try:
+                                # Wait up to 5 seconds for a step update
+                                await asyncio.wait_for(
+                                    self._step_update_condition.wait(), timeout=5.0
+                                )
+                            except asyncio.TimeoutError:
+                                pass  # Timeout is fine, we'll re-check the conditions
+                        # Clear the pending flag after processing
+                        self._step_update_pending = False
+                else:
+                    await asyncio.sleep(0.1)
                 continue
 
             # Execute steps in parallel if multiple are available
@@ -2034,14 +2407,34 @@ class VibeApp(App):
             self._sidebar.set_active_step(None)
         await self._maybe_mark_plan_complete(plan_id)
 
-    async def _wait_for_agent_idle(self) -> None:
-        while True:
-            busy = self._agent_running or (
-                self._agent_init_task and not self._agent_init_task.done()
-            )
-            if not busy:
-                return
-            await asyncio.sleep(0.05)
+    async def _wait_for_agent_idle(self, timeout: float = 60.0) -> None:
+        """Wait for the agent to become idle using event-based signaling.
+
+        Args:
+            timeout: Maximum time to wait in seconds (default 60s).
+        """
+        # Quick check first
+        busy = self._agent_running or (
+            self._agent_init_task and not self._agent_init_task.done()
+        )
+        if not busy:
+            return
+
+        # Wait on event with timeout
+        if self._agent_idle_event:
+            try:
+                await asyncio.wait_for(self._agent_idle_event.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                logger.warning("Timed out waiting for agent to become idle")
+        else:
+            # Fallback to polling if event not initialized
+            while True:
+                busy = self._agent_running or (
+                    self._agent_init_task and not self._agent_init_task.done()
+                )
+                if not busy:
+                    return
+                await asyncio.sleep(0.05)
 
     async def _execute_step_with_subagent(
         self, step: PlanStep, prompt: str
@@ -2109,6 +2502,8 @@ class VibeApp(App):
         await self._refresh_planner_panel(plan)
         if plan:
             await self._emit_step_update_message(plan, step)
+        # Signal step update for event-based waiting
+        self._signal_step_update()
 
     async def _notify_step_decision_needed(self, step: PlanStep) -> None:
         decision_id = step.decision_id
@@ -2145,7 +2540,7 @@ class VibeApp(App):
             )
             self._cancel_plan_executor()
             await self._clear_plan_cards()
-            self._persist_plan_state()
+            await self._persist_plan_state_async()
             self._update_planner_ticker(plan)
 
     async def _load_plan_state(self) -> None:
@@ -2209,7 +2604,7 @@ class VibeApp(App):
         await self._emit_plan_events(plan, include_summary=False)
         self._update_planner_ticker(plan)
         if not self._plan_payload_owned_by_self(payload):
-            self._persist_plan_state()
+            await self._persist_plan_state_async()
         if plan.status == PlanRunStatus.ACTIVE:
             self._start_plan_executor(plan.plan_id)
 

@@ -178,6 +178,13 @@ class ApprovalResponse(StrEnum):
     NO = "n"
 
 
+class ToolDisplayDestination(StrEnum):
+    """Where tool results should be displayed in the UI."""
+
+    CHAT = auto()  # Main chat/messages area
+    SIDEBAR = auto()  # Sidebar panel (e.g., todos)
+
+
 class LLMMessage(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -247,6 +254,7 @@ class ToolResultEvent(BaseEvent):
     skip_reason: str | None = None
     duration: float | None = None
     tool_call_id: str
+    display_destination: ToolDisplayDestination = ToolDisplayDestination.CHAT
 
 
 class CompactStartEvent(BaseEvent):

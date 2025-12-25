@@ -29,6 +29,11 @@ class BlinkingMessage(Static):
         self.update_display()
         self._blink_timer = self.set_interval(0.5, self.toggle_blink)
 
+    def on_unmount(self) -> None:
+        if self._blink_timer:
+            self._blink_timer.stop()
+            self._blink_timer = None
+
     def toggle_blink(self) -> None:
         if not self._is_blinking:
             return

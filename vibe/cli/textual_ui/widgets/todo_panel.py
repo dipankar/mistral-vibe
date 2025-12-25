@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from textual.app import ComposeResult
 from textual.containers import Vertical, VerticalScroll
+from textual.css.query import QueryError
 from textual.message import Message
 from textual.reactive import reactive
 from textual.widgets import Static
@@ -196,5 +197,6 @@ class TodoPanel(Static):
             if event.y <= 2:
                 self.toggle_filter()
                 event.stop()
-        except Exception:
+        except QueryError:
+            # Widget not yet mounted
             pass

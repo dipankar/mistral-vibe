@@ -148,7 +148,8 @@ class WelcomeBanner(Static):
         if self.animation_timer:
             try:
                 self.animation_timer.stop()
-            except Exception:
+            except RuntimeError:
+                # Timer already stopped or cancelled
                 pass
             self.animation_timer = None
 
