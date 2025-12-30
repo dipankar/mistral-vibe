@@ -3,21 +3,95 @@
 from __future__ import annotations
 
 import atexit
-import fcntl
 import logging
 import os
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Generator
+from typing import Generator, Protocol
 
 from vibe.core.config_path import SESSION_LOCK_FILE
 
+try:  # pragma: no cover - import guard
+    import fcntl  # type: ignore[attr-defined]
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - import guard
+    import msvcrt
+except ImportError:  # pragma: no cover - non-Windows
+    msvcrt = None  # type: ignore[assignment, misc]
+
 logger = logging.getLogger(__name__)
+
+
+class _LockBackend(Protocol):
+    def acquire(self, fd: int) -> bool:
+        ...
+
+    def release(self, fd: int) -> None:
+        ...
+
+
+class _PosixLockBackend:
+    def acquire(self, fd: int) -> bool:
+        assert fcntl is not None  # for type checkers
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            return False
+
+    def release(self, fd: int) -> None:
+        assert fcntl is not None  # for type checkers
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+class _WindowsLockBackend:
+    def acquire(self, fd: int) -> bool:
+        assert msvcrt is not None  # for type checkers
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
+
+    def release(self, fd: int) -> None:
+        assert msvcrt is not None  # for type checkers
+        try:
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+
+
+class _NullLockBackend:
+    def __init__(self) -> None:
+        self._warned = False
+
+    def acquire(self, fd: int) -> bool:  # noqa: ARG002 - matches protocol
+        if not self._warned:
+            logger.warning(
+                "OS-level file locking is unavailable; continuing without session locking."
+            )
+            self._warned = True
+        return True
+
+    def release(self, fd: int) -> None:  # noqa: ARG002 - matches protocol
+        pass
+
+
+def _select_lock_backend() -> _LockBackend:
+    if fcntl is not None:
+        return _PosixLockBackend()
+    if msvcrt is not None:
+        return _WindowsLockBackend()
+    return _NullLockBackend()
+
 
 # Track if we've registered the atexit handler
 _atexit_registered = False
 _lock_fd: int | None = None
+_LOCK_BACKEND: _LockBackend = _select_lock_backend()
 
 
 class SessionLockError(Exception):
@@ -82,7 +156,7 @@ def _remove_lock_file() -> None:
         # Release file lock if we hold it
         if _lock_fd is not None:
             try:
-                fcntl.flock(_lock_fd, fcntl.LOCK_UN)
+                _LOCK_BACKEND.release(_lock_fd)
                 os.close(_lock_fd)
             except OSError as e:
                 logger.debug("Failed to release file lock: %s", e)
@@ -138,19 +212,15 @@ def acquire_session_lock() -> bool:
         # Open or create the lock file
         fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
 
-        # Try to acquire exclusive lock (non-blocking)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            # Another process holds the lock
+        if not _LOCK_BACKEND.acquire(fd):
             os.close(fd)
 
-            # Read lock info for error message
             lock_info = _read_lock_file()
             if lock_info:
                 logger.debug(
                     "Lock held by PID %d (started %s)",
-                    lock_info[0], lock_info[1]
+                    lock_info[0],
+                    lock_info[1],
                 )
             return False
 
@@ -158,9 +228,7 @@ def acquire_session_lock() -> bool:
         existing = _read_lock_file()
         if existing and existing[0] != os.getpid():
             if _is_process_running(existing[0]):
-                # Process is still running but we got the flock?
-                # This shouldn't happen, but be safe
-                fcntl.flock(fd, fcntl.LOCK_UN)
+                _LOCK_BACKEND.release(fd)
                 os.close(fd)
                 return False
 

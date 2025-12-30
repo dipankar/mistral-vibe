@@ -182,11 +182,13 @@ class SearchReplace(
         if not content:
             raise ToolError("Empty content provided")
 
-        project_root = self.config.effective_workdir
+        project_root = self.config.effective_workdir.resolve()
         file_path = Path(file_path_str).expanduser()
         if not file_path.is_absolute():
             file_path = project_root / file_path
         file_path = file_path.resolve()
+
+        self._ensure_within_project(file_path, project_root)
 
         if not file_path.exists():
             raise ToolError(f"File does not exist: {file_path}")
@@ -207,6 +209,15 @@ class SearchReplace(
             )
 
         return file_path, search_replace_blocks
+
+    @staticmethod
+    def _ensure_within_project(file_path: Path, project_root: Path) -> None:
+        try:
+            file_path.relative_to(project_root)
+        except ValueError as exc:
+            raise ToolError(
+                f"Security error: Cannot edit '{file_path}' outside of the project directory '{project_root}'."
+            ) from exc
 
     async def _read_file(self, file_path: Path) -> str:
         try:

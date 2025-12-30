@@ -97,10 +97,12 @@ class Todo(
 
         result = event.result
 
-        by_status = {"in_progress": [], "pending": [], "completed": [], "cancelled": []}
+        by_status = {status.value: [] for status in TodoStatus}
 
         for todo in result.todos:
-            by_status[todo.status].append({"content": todo.content, "id": todo.id})
+            by_status[todo.status.value].append(
+                {"content": todo.content, "id": todo.id}
+            )
 
         return ToolResultDisplay(
             success=True,

@@ -106,9 +106,12 @@ class ReadFile(
         self._validate_inputs(args)
 
         file_path = Path(args.path).expanduser()
+        base_dir = self.config.effective_workdir.resolve()
         if not file_path.is_absolute():
-            file_path = self.config.effective_workdir / file_path
+            file_path = base_dir / file_path
 
+        file_path = file_path.resolve()
+        self._validate_within_project(file_path, base_dir)
         self._validate_path(file_path)
         return file_path
 
@@ -154,19 +157,18 @@ class ReadFile(
         if args.limit is not None and args.limit <= 0:
             raise ToolError("Limit, if provided, must be a positive number")
 
-    def _validate_path(self, file_path: Path) -> None:
+    def _validate_within_project(self, file_path: Path, base_dir: Path) -> None:
         try:
-            resolved_path = file_path.resolve()
-        except ValueError:
+            file_path.relative_to(base_dir)
+        except ValueError as exc:
             raise ToolError(
-                f"Security error: Cannot read path '{file_path}' outside of the project directory '{self.config.effective_workdir}'."
-            )
-        except FileNotFoundError:
-            raise ToolError(f"File not found at: {file_path}")
+                f"Security error: Cannot read path '{file_path}' outside of the project directory '{base_dir}'."
+            ) from exc
 
-        if not resolved_path.exists():
+    def _validate_path(self, file_path: Path) -> None:
+        if not file_path.exists():
             raise ToolError(f"File not found at: {file_path}")
-        if resolved_path.is_dir():
+        if file_path.is_dir():
             raise ToolError(f"Path is a directory, not a file: {file_path}")
 
     def _update_state_history(self, file_path: Path) -> None:

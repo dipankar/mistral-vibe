@@ -106,6 +106,12 @@ class BottomApp(StrEnum):
     Input = auto()
 
 
+class PlanTriggerDecision(StrEnum):
+    PLAN = "plan"
+    SKIP = "skip"
+    ASK = "ask"
+
+
 class VibeApp(App):
     ENABLE_COMMAND_PALETTE = False
     CSS_PATH = "app.tcss"
@@ -168,6 +174,7 @@ class VibeApp(App):
         self._planner_auto_start = config.planner_auto_start
         self._thinking_mode = config.thinking_mode_enabled
         self.theme = config.textual_theme
+        self._pending_plan_confirmation: str | None = None
 
         self.history_file = HISTORY_FILE.path
 
@@ -727,6 +734,13 @@ class VibeApp(App):
             await self._loading_widget.remove()
             self._loading_widget = None
 
+    async def _detach_loading_widget(self, loading: LoadingWidget) -> None:
+        """Remove a specific loading widget instance without touching others."""
+        if loading.parent:
+            await loading.remove()
+        if self._loading_widget is loading:
+            self._loading_widget = None
+
     def on_config_app_setting_changed(self, message: ConfigApp.SettingChanged) -> None:
         if message.key == "textual_theme":
             self.theme = message.value
@@ -875,13 +889,23 @@ class VibeApp(App):
 
         await self._mount_and_scroll(user_message)
 
+        if self._pending_plan_confirmation:
+            handled = await self._handle_plan_confirmation_response(message)
+            if handled:
+                return
+
         if (
             self._planner_auto_start
             and not self._thinking_mode
             and self._should_autostart_plan()
         ):
-            await self._start_planning(message)
-            return
+            plan_decision = self._assess_plan_need(message)
+            if plan_decision is PlanTriggerDecision.PLAN:
+                await self._start_planning(message)
+                return
+            if plan_decision is PlanTriggerDecision.ASK:
+                await self._prompt_for_plan_confirmation(message)
+                return
 
         thinking_outline = None
         if self._thinking_mode:
@@ -917,9 +941,7 @@ class VibeApp(App):
                 try:
                     await init_task
                 finally:
-                    if self._loading_widget and self._loading_widget.parent:
-                        await self._loading_widget.remove()
-                        self._loading_widget = None
+                    await self._detach_loading_widget(loading)
                     if pending_init:
                         await user_message.set_pending(False)
             elif pending_init:
@@ -1085,14 +1107,12 @@ class VibeApp(App):
                     await self._refresh_memory_panel()
 
         except asyncio.CancelledError:
-            if self._loading_widget and self._loading_widget.parent:
-                await self._loading_widget.remove()
+            await self._detach_loading_widget(loading)
             if self.event_handler:
                 self.event_handler.stop_current_tool_call()
             raise
         except Exception as e:
-            if self._loading_widget and self._loading_widget.parent:
-                await self._loading_widget.remove()
+            await self._detach_loading_widget(loading)
             if self.event_handler:
                 self.event_handler.stop_current_tool_call()
 
@@ -1129,9 +1149,7 @@ class VibeApp(App):
             self._agent_running = False
             self._interrupt_requested = False
             self._agent_task = None
-            if self._loading_widget:
-                await self._loading_widget.remove()
-            self._loading_widget = None
+            await self._detach_loading_widget(loading)
             await self._finalize_current_streaming_message()
             self._signal_agent_idle()
 
@@ -1197,6 +1215,9 @@ class VibeApp(App):
                 )
             )
             return
+        await self._mount_and_scroll(
+            UserCommandMessage("Working on getting the subagents ready…")
+        )
 
         planner = self._ensure_planner()
         await self._clear_plan_cards()
@@ -1217,6 +1238,129 @@ class VibeApp(App):
         if not plan:
             return True
         return plan.status in (PlanRunStatus.COMPLETED, PlanRunStatus.CANCELLED)
+
+    def _assess_plan_need(self, message: str) -> PlanTriggerDecision:
+        """Heuristic check to decide whether to kick off planning for a message."""
+        normalized = message.strip().lower()
+        if not normalized:
+            return PlanTriggerDecision.SKIP
+
+        action_keywords = [
+            "implement",
+            "build",
+            "refactor",
+            "migrate",
+            "create",
+            "develop",
+            "rewrite",
+            "optimize",
+            "fix",
+            "support",
+            "scaffold",
+            "automate",
+            "generate",
+            "test ",
+            "add ",
+            "remove ",
+        ]
+        question_prefixes = [
+            "describe",
+            "what",
+            "why",
+            "who",
+            "where",
+            "when",
+            "which",
+            "explain",
+            "show",
+            "list",
+            "tell me",
+            "summarize",
+        ]
+
+        contains_action_kw = any(keyword in normalized for keyword in action_keywords)
+        strong_plan_terms = [
+            "multistep",
+            "multi-step",
+            "roadmap",
+            "strategy",
+            "outline steps",
+            "execution plan",
+            "timeline",
+        ]
+        if any(term in normalized for term in strong_plan_terms):
+            return PlanTriggerDecision.PLAN
+
+        if normalized.startswith("/plan"):
+            return PlanTriggerDecision.PLAN
+
+        if any(normalized.startswith(prefix + " ") for prefix in question_prefixes):
+            if not contains_action_kw:
+                return PlanTriggerDecision.SKIP
+
+        if normalized.endswith("?") and not (
+            "how to" in normalized or "how do" in normalized or contains_action_kw
+        ):
+            return PlanTriggerDecision.SKIP
+
+        token_count = len(normalized.split())
+        bullet_points = message.count("\n-") + message.count("\n*")
+        numbered_items = bool(re.search(r"\d+\.", message))
+        conjunction_rich = normalized.count(" and ") + normalized.count(" then ")
+        plan_score = 0
+
+        if contains_action_kw:
+            plan_score += 1
+        if token_count >= 80:
+            plan_score += 2
+        elif token_count >= 40:
+            plan_score += 1
+        if bullet_points >= 2 or numbered_items:
+            plan_score += 1
+        if conjunction_rich >= 2:
+            plan_score += 1
+        if "\n" in message and len(message.splitlines()) >= 3:
+            plan_score += 1
+
+        if plan_score >= 2:
+            return PlanTriggerDecision.PLAN
+        if plan_score == 0:
+            return PlanTriggerDecision.SKIP
+        return PlanTriggerDecision.ASK
+
+    async def _prompt_for_plan_confirmation(self, goal: str) -> None:
+        self._pending_plan_confirmation = goal
+        await self._mount_and_scroll(
+            UserCommandMessage(
+                "This request might benefit from a planning session. "
+                "Reply `yes` to generate a plan with sub-agents or `no` to continue directly."
+            )
+        )
+
+    async def _handle_plan_confirmation_response(self, message: str) -> bool:
+        if not self._pending_plan_confirmation:
+            return False
+
+        response = message.strip().lower()
+        affirmative = {"y", "yes", "sure", "please", "do it", "go ahead"}
+        negative = {"n", "no", "skip", "not now", "nope"}
+
+        if response in affirmative or response.startswith("yes"):
+            goal = self._pending_plan_confirmation
+            self._pending_plan_confirmation = None
+            await self._start_planning(goal)
+            return True
+
+        if response in negative or response.startswith("no "):
+            self._pending_plan_confirmation = None
+            await self._mount_and_scroll(
+                UserCommandMessage("Okay, continuing without a planning session.")
+            )
+            return True
+
+        # Treat ambiguous responses as a new request
+        self._pending_plan_confirmation = None
+        return False
 
     def _format_plan_summary(self, plan: PlanState) -> str:
         status = plan.status.value.replace("_", " ").title()
@@ -2504,9 +2648,7 @@ class VibeApp(App):
                 if self._event_dispatcher:
                     await self._event_dispatcher.dispatch(event)
         finally:
-            if self._loading_widget and self._loading_widget.parent:
-                await self._loading_widget.remove()
-            self._loading_widget = None
+            await self._detach_loading_widget(loading)
 
         return subagent.get_result()
 
