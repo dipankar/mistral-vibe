@@ -45,7 +45,7 @@ class SubagentActivityPanel(Static):
     """Tabbed tree view summarizing live subagent work."""
 
     def __init__(self, **kwargs) -> None:
-        super().__init__(**kwargs)
+        super().__init__("", **kwargs)
         self.add_class("subagent-activity-panel")
         self._tab_container: Horizontal | None = None
         self._detail: Static | None = None

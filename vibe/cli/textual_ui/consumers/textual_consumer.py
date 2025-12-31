@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Protocol
 
-from textual.widgets import Static
-
 from vibe.cli.textual_ui.widgets.compact import CompactMessage
 from vibe.cli.textual_ui.widgets.messages import (
     AssistantMessage,
@@ -25,11 +23,12 @@ from vibe.core.types import (
     PlanResourceWarningEvent,
     PlanStartedEvent,
     PlanStepUpdateEvent,
+    SubagentProgressEvent,
     ToolCallEvent,
     ToolDisplayDestination,
     ToolResultEvent,
 )
-from vibe.core.utils import TaggedText
+from vibe.core.utils import TaggedText, logger
 
 if TYPE_CHECKING:
     from textual.widget import Widget
@@ -207,9 +206,7 @@ class TextualEventConsumer(IEventConsumer):
 
     async def on_unknown(self, event: BaseEvent) -> None:
         """Handle unrecognized event types."""
-        await self._app.mount_to_chat(
-            Static(str(event), markup=False, classes="unknown-event")
-        )
+        logger.debug("Ignoring unhandled event %s", event.__class__.__name__)
 
     def _sanitize_event(self, event: ToolResultEvent) -> ToolResultEvent:
         """Sanitize error messages in tool result."""
@@ -305,6 +302,9 @@ class TextualEventConsumer(IEventConsumer):
                 return None
             case PlanResourceWarningEvent():
                 await self.on_plan_resource_warning(event)
+                return None
+            case SubagentProgressEvent():
+                # Progress is handled separately; do not render to chat log.
                 return None
             case _:
                 await self.on_unknown(event)

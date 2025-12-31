@@ -243,6 +243,7 @@ class VibeApp(App):
         self._rate_limit_warning = False
         self._rate_limit_reset_task: asyncio.Task | None = None
         self._sidebar: Sidebar | None = None
+        self._subagent_panel_slot: Vertical | None = None
         self._subagent_panel: SubagentActivityPanel | None = None
 
         # Event-based signaling for responsiveness (initialized lazily)
@@ -480,6 +481,8 @@ class VibeApp(App):
                         yield WelcomeBanner(self.config)
                         yield Static(id="messages")
 
+                    yield Vertical(id="subagent-panel-slot")
+
                     with Horizontal(id="loading-area"):
                         yield Static(id="loading-area-content")
                         yield ModeIndicator(auto_approve=self.auto_approve)
@@ -511,8 +514,10 @@ class VibeApp(App):
         # Initialize event-based signaling
         self._ensure_events()
 
-        # Get reference to enhanced sidebar
+        # Get reference to enhanced sidebar and subagent slot
         self._sidebar = self.query_one(Sidebar)
+        self._subagent_panel_slot = self.query_one("#subagent-panel-slot", Vertical)
+        self._subagent_panel = None
         # Initialize UI state and consumer
         self._ui_state = UIState(self)
         self.event_handler = TextualEventConsumer(self)
@@ -736,10 +741,6 @@ class VibeApp(App):
         if not self._subagent_entries:
             if self._subagent_panel:
                 try:
-                    await self._subagent_panel.clear_entries()
-                except Exception:
-                    pass
-                try:
                     await self._subagent_panel.remove()
                 except Exception:
                     pass
@@ -747,9 +748,11 @@ class VibeApp(App):
             return
 
         if not self._subagent_panel:
+            if not self._subagent_panel_slot:
+                return
             panel = SubagentActivityPanel(id="subagent-activity-panel")
             self._subagent_panel = panel
-            await self._mount_and_scroll(panel)
+            await self._subagent_panel_slot.mount(panel)
 
         entries = list(self._subagent_entries.values())
         await self._subagent_panel.update_entries(entries)
@@ -1873,11 +1876,7 @@ class VibeApp(App):
                 await self._subagent_panel.clear_entries()
             except Exception:
                 pass
-            try:
-                await self._subagent_panel.remove()
-            except Exception:
-                pass
-            self._subagent_panel = None
+            self._subagent_panel.display = False
 
         for message in list(self._plan_decision_cards.values()):
             try:

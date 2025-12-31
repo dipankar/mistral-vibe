@@ -62,12 +62,16 @@ Screen {
     padding: 0 2 0 2;
 }
 
-#subagent-activity-panel {
+.subagent-activity-panel {
     width: 100%;
     background: $surface;
     border: round $foreground-muted;
     padding: 1;
-    margin: 0 2 1 2;
+    margin: 1 0;
+    height: auto;
+    max-height: 16;
+    min-height: 5;
+    overflow-y: auto;
 }
 
 .subagent-panel-title {
@@ -252,38 +256,49 @@ Screen {
     margin-bottom: 1;
 }
 
-.plan-confirmation-buttons {
+.plan-confirmation-heading {
     width: 100%;
-    layout: vertical;
+    align: left middle;
+    margin-bottom: 1;
 }
 
-.plan-confirmation-button {
+.plan-confirmation-title {
+    color: $text;
+    text-style: bold;
+    margin-right: 1;
+}
+
+.plan-confirmation-mode {
+    color: $text-muted;
+}
+
+.plan-confirmation-options {
     width: 100%;
-    margin-right: 0;
-    padding: 1;
+    layout: horizontal;
+}
+
+.plan-confirmation-option + .plan-confirmation-option {
+    margin-left: 1;
+}
+
+.plan-confirmation-option {
+    flex: 1;
+    justify-content: center;
+    border: round $foreground-muted;
+}
+
+.plan-confirmation-option-selected {
+    border: double $primary;
+    color: $primary;
+}
+
+.plan-confirmation-text {
+    margin-bottom: 1;
 }
 
 .plan-confirmation-help {
     margin-top: 1;
     color: $text-muted;
-}
-
-.plan-decision-controls {
-    margin-top: 1;
-}
-
-.plan-decision-input {
-    width: 100%;
-    background: $background;
-    border: round $foreground-muted;
-    color: $text;
-    padding: 0 1;
-}
-
-.plan-decision-button {
-    width: auto;
-    margin-right: 1;
-    margin-top: 1;
 }
 
 .plan-decision-status {

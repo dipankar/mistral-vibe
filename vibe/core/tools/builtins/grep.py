@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from enum import StrEnum, auto
 from pathlib import Path
 import shutil
 from typing import TYPE_CHECKING, ClassVar
@@ -19,11 +18,6 @@ from vibe.core.tools.ui import ToolCallDisplay, ToolResultDisplay, ToolUIData
 
 if TYPE_CHECKING:
     from vibe.core.types import ToolCallEvent, ToolResultEvent
-
-
-class GrepBackend(StrEnum):
-    RIPGREP = auto()
-    GNU_GREP = auto()
 
 
 class GrepToolConfig(BaseToolConfig):
@@ -100,27 +94,25 @@ class Grep(
     ToolUIData[GrepArgs, GrepResult],
 ):
     description: ClassVar[str] = (
-        "Recursively search files for a regex pattern using ripgrep (rg) or grep. "
-        "Respects .gitignore and .codeignore files by default when using ripgrep."
+        "Recursively search files for a regex pattern using ripgrep (rg). "
+        "Respects .gitignore and .codeignore files by default."
     )
 
-    def _detect_backend(self) -> GrepBackend:
+    def _ensure_ripgrep(self) -> None:
         if shutil.which("rg"):
-            return GrepBackend.RIPGREP
-        if shutil.which("grep"):
-            return GrepBackend.GNU_GREP
+            return
         raise ToolError(
-            "Neither ripgrep (rg) nor grep is installed. "
+            "ripgrep (rg) is required but was not found in PATH. "
             "Please install ripgrep: https://github.com/BurntSushi/ripgrep#installation"
         )
 
     async def run(self, args: GrepArgs) -> GrepResult:
-        backend = self._detect_backend()
+        self._ensure_ripgrep()
         self._validate_args(args)
         self.state.search_history.append(args.pattern)
 
         exclude_patterns = self._collect_exclude_patterns()
-        cmd = self._build_command(args, exclude_patterns, backend)
+        cmd = self._build_ripgrep_command(args, exclude_patterns)
         stdout = await self._execute_search(cmd)
 
         return self._parse_output(
@@ -160,13 +152,6 @@ class Grep(
 
         return patterns
 
-    def _build_command(
-        self, args: GrepArgs, exclude_patterns: list[str], backend: GrepBackend
-    ) -> list[str]:
-        if backend == GrepBackend.RIPGREP:
-            return self._build_ripgrep_command(args, exclude_patterns)
-        return self._build_gnu_grep_command(args, exclude_patterns)
-
     def _build_ripgrep_command(
         self, args: GrepArgs, exclude_patterns: list[str]
     ) -> list[str]:
@@ -188,27 +173,6 @@ class Grep(
 
         for pattern in exclude_patterns:
             cmd.extend(["--glob", f"!{pattern}"])
-
-        cmd.extend(["-e", args.pattern, args.path])
-
-        return cmd
-
-    def _build_gnu_grep_command(
-        self, args: GrepArgs, exclude_patterns: list[str]
-    ) -> list[str]:
-        max_matches = args.max_matches or self.config.default_max_matches
-
-        cmd = ["grep", "-r", "-n", "-I", "-E", f"--max-count={max_matches + 1}"]
-
-        if args.pattern.islower():
-            cmd.append("-i")
-
-        for pattern in exclude_patterns:
-            if pattern.endswith("/"):
-                dir_pattern = pattern.rstrip("/")
-                cmd.append(f"--exclude-dir={dir_pattern}")
-            else:
-                cmd.append(f"--exclude={pattern}")
 
         cmd.extend(["-e", args.pattern, args.path])
 
@@ -243,14 +207,14 @@ class Grep(
 
             if proc.returncode not in {0, 1}:
                 error_msg = stderr or f"Process exited with code {proc.returncode}"
-                raise ToolError(f"grep error: {error_msg}")
+                raise ToolError(f"rg error: {error_msg}")
 
             return stdout
 
         except ToolError:
             raise
         except Exception as exc:
-            raise ToolError(f"Error running grep: {exc}") from exc
+            raise ToolError(f"Error running rg: {exc}") from exc
 
     def _parse_output(self, stdout: str, max_matches: int) -> GrepResult:
         output_lines = stdout.splitlines() if stdout else []
