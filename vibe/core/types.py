@@ -5,6 +5,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum, auto
 from typing import Annotated, Any, Literal
+from uuid import uuid4
 
 from pydantic import (
     BaseModel,
@@ -228,6 +229,7 @@ class BaseEvent(BaseModel, ABC):
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
+    event_id: str = Field(default_factory=lambda: uuid4().hex)
     # Optional subagent context for events from parallel step execution
     subagent_id: str | None = None
     subagent_step_id: str | None = None

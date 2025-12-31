@@ -1,16 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-from enum import StrEnum, auto
-import hashlib
-import os
-import re
+import inspect
 import subprocess
+from collections import deque
+from enum import StrEnum, auto
 from typing import Any, Callable, ClassVar, Coroutine, assert_never
-
-import json
-from pathlib import Path
-from uuid import uuid4
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
@@ -23,10 +18,20 @@ from vibe.cli.clipboard import copy_selection_to_clipboard
 from vibe.cli.commands import CommandRegistry
 from vibe.cli.textual_ui.consumers.textual_consumer import TextualEventConsumer
 from vibe.cli.textual_ui.ui_state import UIState
+from vibe.cli.textual_ui.planner_controller import PlannerCallbacks, PlannerController
+from vibe.cli.textual_ui.planner_ui_controller import (
+    PendingPlanRequest,
+    PlanConfirmationHooks,
+    PlannerUIController,
+)
+from vibe.cli.textual_ui.app_controller import AgentHooks, AppController
+from vibe.cli.textual_ui.bottom_panel_manager import BottomPanelManager
+from vibe.cli.textual_ui.command_controller import CommandController
 from vibe.core.dispatchers import EventDispatcher
+from vibe.cli.textual_ui.event_bus_adapter import EventBusAdapter
+from vibe.cli.textual_ui.presenters import ChatInputPresenter
 from vibe.cli.textual_ui.widgets.approval_app import ApprovalApp
 from vibe.cli.textual_ui.widgets.chat_input import ChatInputContainer
-from vibe.cli.textual_ui.widgets.compact import CompactMessage
 from vibe.cli.textual_ui.widgets.config_app import ConfigApp
 from vibe.cli.textual_ui.widgets.context_progress import ContextProgress, TokenState
 from vibe.cli.textual_ui.widgets.loading import LoadingWidget
@@ -50,6 +55,7 @@ from vibe.cli.textual_ui.widgets.path_display import PathDisplay
 from vibe.cli.textual_ui.widgets.sidebar import Sidebar
 from vibe.cli.textual_ui.widgets.tools import ToolCallMessage, ToolResultMessage
 from vibe.cli.textual_ui.widgets.welcome import WelcomeBanner
+from vibe.cli.textual_ui.state_store import BottomPanelMode, UIStateStore
 from vibe.cli.update_notifier import (
     FileSystemUpdateCacheRepository,
     PyPIVersionUpdateGateway,
@@ -70,13 +76,13 @@ from vibe.core.planner import (
     PlanState,
     PlanStep,
     PlanStepStatus,
-    PlannerAgent,
 )
 from vibe.core.subagent import SubAgent, SubAgentConfig, SubAgentResult
 from vibe.core.system_prompt import get_universal_system_prompt
 from vibe.core.tools.base import BaseToolConfig, ToolPermission
 from vibe.core.types import (
     ApprovalResponse,
+    BaseEvent,
     CompactEndEvent,
     LLMMessage,
     MemoryEntryEvent,
@@ -99,18 +105,6 @@ DEFAULT_THINKING_MODE_INSTRUCTIONS = (
     "three bullet points that outline reasoning, risks, or next checks. After that, provide an "
     "'Answer' section with actionable guidance. Keep Thoughts under 100 words."
 )
-
-class BottomApp(StrEnum):
-    Approval = auto()
-    Config = auto()
-    Input = auto()
-
-
-class PlanTriggerDecision(StrEnum):
-    PLAN = "plan"
-    SKIP = "skip"
-    ASK = "ask"
-
 
 class VibeApp(App):
     ENABLE_COMMAND_PALETTE = False
@@ -156,30 +150,67 @@ class VibeApp(App):
         self._pending_approval: asyncio.Future | None = None
 
         self.event_handler: TextualEventConsumer | None = None
-        self._event_dispatcher: EventDispatcher | None = None
+        self._event_bus_adapter = EventBusAdapter(self.config.effective_workdir)
+        self._event_dispatcher = EventDispatcher(event_bus=self._event_bus_adapter.publisher)
+        self._ui_event_dispatcher: EventDispatcher | None = None
+        self._ui_dispatcher_registered = False
         self._ui_state: UIState | None = None
         self.commands = CommandRegistry()
 
         self._chat_input_container: ChatInputContainer | None = None
+        self._chat_input_presenter: ChatInputPresenter | None = None
         self._mode_indicator: ModeIndicator | None = None
         self._context_progress: ContextProgress | None = None
         self._planner_ticker: PlannerTicker | None = None
         self._memory_panel: MemoryPanel | None = None
-        self._planner_agent: PlannerAgent | None = None
-        self._plan_executor_worker: Worker | None = None
-        self._plan_executor_plan_id: str | None = None
-        self._planner_instance_id = uuid4().hex
-        self._plan_state_file = self._build_plan_state_path()
-        self._current_bottom_app: BottomApp = BottomApp.Input
+        self._ui_store = UIStateStore()
+        self._chat_input_presenter = ChatInputPresenter(self._ui_store)
+        self._bottom_panel_manager = BottomPanelManager(self, self._ui_store)
+        self._planner_controller: PlannerController | None = None
+        callbacks = PlannerCallbacks(
+            refresh_plan=self._refresh_planner_panel,
+            clear_plan_cards=self._clear_plan_cards,
+            append_message=self._planner_append_message,
+            update_step_card=self._mount_or_update_step_card,
+            notify_decision_required=self._notify_step_decision_needed,
+            set_active_step=self._set_active_plan_step,
+            run_subagent=self._execute_step_with_subagent,
+            wait_for_agent_idle=self._wait_for_agent_idle,
+        )
+        self._planner_controller = PlannerController(
+            config=self.config,
+            ui_store=self._ui_store,
+            callbacks=callbacks,
+            run_worker=self.run_worker,
+            call_later=self.call_later,
+        )
+        confirmation_hooks = PlanConfirmationHooks(
+            send_user_message=self._mount_and_scroll,
+            start_planning=self._start_planning,
+            continue_request=self._continue_pending_request,
+            get_thinking_mode=lambda: self._thinking_mode,
+        )
+        self._planner_ui = PlannerUIController(self._ui_store, confirmation_hooks)
         self._planner_auto_start = config.planner_auto_start
         self._thinking_mode = config.thinking_mode_enabled
+        self._app_controller: AppController | None = None
+        agent_hooks = AgentHooks(
+            ensure_agent_init_task=self._ensure_agent_init_task,
+            mount_message=self._mount_and_scroll,
+            start_processing=self._continue_pending_request,
+        )
+        self._app_controller = AppController(
+            planner_ui=self._planner_ui,
+            agent_hooks=agent_hooks,
+            planner_auto_start_enabled=lambda: self._planner_auto_start,
+            thinking_mode_enabled=lambda: self._thinking_mode,
+            should_autostart_plan=self._should_autostart_plan,
+        )
+        self._command_controller = CommandController(self)
         self.theme = config.textual_theme
-        self._pending_plan_confirmation: str | None = None
 
         self.history_file = HISTORY_FILE.path
 
-        self._tools_collapsed = True
-        self._todos_collapsed = False
         self._current_streaming_message: AssistantMessage | None = None
         self._version_update_notifier = version_update_notifier
         self._update_cache_repository = update_cache_repository
@@ -205,9 +236,6 @@ class VibeApp(App):
 
         # Event-based signaling for responsiveness (initialized lazily)
         self._agent_idle_event: asyncio.Event | None = None
-        # Use Condition instead of Event to prevent missed signals
-        self._step_update_condition: asyncio.Condition | None = None
-        self._step_update_pending: bool = False  # Flag to track pending updates
 
         # Lock for protecting agent state transitions
         self._agent_state_lock: asyncio.Lock | None = None
@@ -217,16 +245,80 @@ class VibeApp(App):
         self._retry_count: int = 0
         self._max_retries: int = 3
         self._retry_delay_base: float = 1.0  # seconds, exponential backoff
+        self._local_event_ids: deque[str] = deque()
+        self._local_event_id_set: set[str] = set()
+        self._local_event_window = 512
+
+    @property
+    def ui_store(self) -> UIStateStore:
+        return self._ui_store
 
     def _ensure_events(self) -> None:
         """Ensure event objects and locks are created (must be called from async context)."""
         if self._agent_idle_event is None:
             self._agent_idle_event = asyncio.Event()
             self._agent_idle_event.set()  # Start in idle state
-        if self._step_update_condition is None:
-            self._step_update_condition = asyncio.Condition()
         if self._agent_state_lock is None:
             self._agent_state_lock = asyncio.Lock()
+
+    def _setup_event_routing(self) -> None:
+        if not self.event_handler or not self._event_dispatcher:
+            return
+
+        if not self._ui_dispatcher_registered:
+            self._event_dispatcher.add_consumer(self.event_handler)
+            self._ui_dispatcher_registered = True
+
+        if self._ui_event_dispatcher is None:
+            self._ui_event_dispatcher = EventDispatcher()
+            self._ui_event_dispatcher.add_consumer(self.event_handler)
+        self._event_bus_adapter.start_listener(self._handle_bus_event)
+
+    def _record_local_event(self, event: BaseEvent) -> None:
+        event_id = getattr(event, "event_id", None)
+        if not event_id:
+            return
+        self._local_event_ids.append(event_id)
+        self._local_event_id_set.add(event_id)
+        if len(self._local_event_ids) > self._local_event_window:
+            old_id = self._local_event_ids.popleft()
+            self._local_event_id_set.discard(old_id)
+
+    def _should_ignore_bus_event(self, event: BaseEvent) -> bool:
+        event_id = getattr(event, "event_id", None)
+        if not event_id:
+            return False
+        if event_id not in self._local_event_id_set:
+            return False
+        self._local_event_id_set.discard(event_id)
+        try:
+            self._local_event_ids.remove(event_id)
+        except ValueError:
+            pass
+        return True
+
+    async def _dispatch_ui_event(self, event: BaseEvent, *, force: bool = False) -> None:
+        if not self._ui_event_dispatcher:
+            return
+        if not force and self._ui_dispatcher_registered:
+            return
+        await self._ui_event_dispatcher.dispatch(event)
+
+    async def _fan_out_event(self, event: BaseEvent) -> None:
+        if not self._event_dispatcher:
+            return
+        await self._event_dispatcher.dispatch(event)
+        self._record_local_event(event)
+        await self._dispatch_ui_event(event)
+
+    async def _handle_bus_event(self, event: BaseEvent) -> None:
+        if self._should_ignore_bus_event(event):
+            return
+        await self._dispatch_ui_event(event, force=True)
+
+    async def _shutdown_event_bus(self) -> None:
+        await self._event_bus_adapter.stop_listener()
+        self._event_bus_adapter.close()
 
     def _signal_agent_busy(self) -> None:
         """Signal that the agent has started working."""
@@ -237,20 +329,6 @@ class VibeApp(App):
         """Signal that the agent has become idle."""
         if self._agent_idle_event:
             self._agent_idle_event.set()
-
-    def _signal_step_update(self) -> None:
-        """Signal that a plan step status has changed."""
-        # Set pending flag and schedule async notification
-        self._step_update_pending = True
-        if self._step_update_condition:
-            # Schedule the async notification
-            self.call_later(self._notify_step_update)
-
-    async def _notify_step_update(self) -> None:
-        """Notify waiters that a step update occurred."""
-        if self._step_update_condition:
-            async with self._step_update_condition:
-                self._step_update_condition.notify_all()
 
     def _is_retryable_error(self, error: Exception | str) -> bool:
         """Check if an error is transient and worth retrying."""
@@ -286,44 +364,7 @@ class VibeApp(App):
         self._retry_count = 0
 
     async def _retry_last_prompt(self) -> None:
-        """Retry the last failed prompt with exponential backoff."""
-        if not self._last_failed_prompt:
-            await self._mount_and_scroll(
-                UserCommandMessage("No failed operation to retry.")
-            )
-            return
-
-        if self._retry_count >= self._max_retries:
-            await self._mount_and_scroll(
-                ErrorMessage(
-                    f"Max retries ({self._max_retries}) exceeded. Please try again later.",
-                    collapsed=self._tools_collapsed,
-                )
-            )
-            self._reset_retry_state()
-            return
-
-        delay = self._get_retry_delay()
-        self._retry_count += 1
-
-        await self._mount_and_scroll(
-            UserCommandMessage(
-                f"Retrying (attempt {self._retry_count}/{self._max_retries}) "
-                f"after {delay:.1f}s delay..."
-            )
-        )
-
-        await asyncio.sleep(delay)
-
-        # Re-run the failed prompt
-        prompt = self._last_failed_prompt
-        self._last_failed_prompt = None  # Clear before retry
-
-        if self.agent and not self._agent_running:
-            self._agent_task = self._create_safe_task(
-                self._handle_agent_turn(prompt),
-                name="agent-turn-retry",
-            )
+        await self._command_controller.retry_last_prompt()
 
     def _create_safe_task(
         self,
@@ -360,36 +401,38 @@ class VibeApp(App):
         return task
 
     def compose(self) -> ComposeResult:
-        with Horizontal(id="app-layout"):
-            with Vertical(id="main-root"):
-                with VerticalScroll(id="chat"):
-                    yield WelcomeBanner(self.config)
-                    yield Static(id="messages")
+        with Vertical(id="app-root"):
+            with Horizontal(id="app-layout"):
+                with Vertical(id="main-root"):
+                    with VerticalScroll(id="chat"):
+                        yield WelcomeBanner(self.config)
+                        yield Static(id="messages")
 
-                with Horizontal(id="loading-area"):
-                    yield Static(id="loading-area-content")
-                    yield ModeIndicator(auto_approve=self.auto_approve)
+                    with Horizontal(id="loading-area"):
+                        yield Static(id="loading-area-content")
+                        yield ModeIndicator(auto_approve=self.auto_approve)
 
-                with Static(id="bottom-app-container"):
-                    yield ChatInputContainer(
-                        history_file=self.history_file,
-                        command_registry=self.commands,
-                        id="input-container",
-                        show_warning=self.auto_approve,
-                    )
+                with Vertical(id="sidebar"):
+                    yield Sidebar()
 
-                with Horizontal(id="bottom-bar"):
-                    yield PathDisplay(
-                        self.config.displayed_workdir or self.config.effective_workdir
-                    )
-                    yield Static(id="spacer")
-                    yield PlannerTicker(id="planner-ticker")
-                    yield ContextProgress()
+            with Static(id="bottom-app-container"):
+                yield ChatInputContainer(
+                    history_file=self.history_file,
+                    command_registry=self.commands,
+                    id="input-container",
+                    show_warning=self.auto_approve,
+                )
 
-                yield MemoryPanel()
+            with Horizontal(id="bottom-bar"):
+                path_widget = PathDisplay(
+                    self.config.displayed_workdir or self.config.effective_workdir
+                )
+                path_widget.add_class("path-display")
+                yield path_widget
+                yield PlannerTicker(id="planner-ticker")
+                yield ContextProgress()
 
-            with Vertical(id="sidebar"):
-                yield Sidebar()
+            yield MemoryPanel()
 
 
     async def on_mount(self) -> None:
@@ -399,11 +442,10 @@ class VibeApp(App):
         # Get reference to enhanced sidebar
         self._sidebar = self.query_one(Sidebar)
 
-        # Initialize UI state, event dispatcher, and consumer
+        # Initialize UI state and consumer
         self._ui_state = UIState(self)
-        self._event_dispatcher = EventDispatcher()
         self.event_handler = TextualEventConsumer(self)
-        self._event_dispatcher.add_consumer(self.event_handler)
+        self._setup_event_routing()
 
         self._chat_input_container = self.query_one(ChatInputContainer)
         self._mode_indicator = self.query_one(ModeIndicator)
@@ -411,6 +453,7 @@ class VibeApp(App):
         self._planner_ticker = self.query_one(PlannerTicker)
         self._memory_panel = self.query_one(MemoryPanel)
         if self._chat_input_container:
+            self._chat_input_presenter.set_container(self._chat_input_container)
             self._chat_input_container.set_thinking_mode(self._thinking_mode)
         await self._ensure_todo_placeholder()
 
@@ -439,6 +482,14 @@ class VibeApp(App):
             self._ensure_agent_init_task()
 
         await self._load_plan_state()
+
+    async def on_unmount(self) -> None:
+        await self._shutdown_event_bus()
+        parent_on_unmount = getattr(super(), "on_unmount", None)
+        if parent_on_unmount:
+            maybe_coro = parent_on_unmount()
+            if inspect.isawaitable(maybe_coro):
+                await maybe_coro
 
     def _process_initial_prompt(self) -> None:
         if self._initial_prompt:
@@ -472,8 +523,8 @@ class VibeApp(App):
             return
 
         plan_state = plan
-        if plan_state is None and self._planner_agent:
-            plan_state = self._planner_agent.get_plan()
+        if plan_state is None and self._planner_controller:
+            plan_state = self._planner_controller.get_plan()
 
         max_tokens = self._current_token_state.max_tokens
         current_tokens = self._current_token_state.current_tokens
@@ -573,14 +624,13 @@ class VibeApp(App):
             return None
 
         truncated_prompt = prompt_text if len(prompt_text) <= 2000 else f"{prompt_text[:2000]}…"
-        planner = PlannerAgent(self.config)
+        if not self._planner_controller:
+            return None
 
-        try:
-            plan = await planner.start_plan(
-                f"Thinking mode outline for the following request:\n{truncated_prompt}"
-            )
-        except Exception as exc:
-            logger.debug("Thinking mode planner failed", exc_info=exc)
+        plan = await self._planner_controller.preview_plan(
+            f"Thinking mode outline for the following request:\n{truncated_prompt}"
+        )
+        if not plan:
             return None
 
         await self._mount_and_scroll(ThinkingPlanMessage(plan))
@@ -606,24 +656,7 @@ class VibeApp(App):
             )
 
     async def _memory_command(self, argument: str | None = None) -> None:
-        action = (argument or "").strip().lower()
-        if action == "clear":
-            if not self.agent:
-                await self._mount_and_scroll(
-                    ErrorMessage(
-                        "Cannot clear memory until the agent starts.",
-                        collapsed=self._tools_collapsed,
-                    )
-                )
-                return
-            self.agent.session_memory.clear()
-            await self._refresh_memory_panel()
-            await self._mount_and_scroll(
-                UserCommandMessage("Session memory cleared for this run.")
-            )
-            return
-
-        await self._show_memory_panel()
+        await self._command_controller.memory_command(argument)
 
     async def _ensure_todo_placeholder(self) -> None:
         # TodoPanel now handles empty state automatically
@@ -663,28 +696,18 @@ class VibeApp(App):
             UserCommandMessage(f"Thinking mode {status}. Tab toggles this mode.")
         )
 
-    async def _toggle_thinking_mode(self, argument: str | None = None) -> None:
-        """Toggle or set thinking mode via /think command."""
-        mode = (argument or "").strip().lower()
-        if mode in {"on", "true", "enable", "enabled"}:
-            self._set_thinking_mode(True)
-            await self._mount_and_scroll(
-                UserCommandMessage("Thinking mode enabled.")
-            )
-            return
-        if mode in {"off", "false", "disable", "disabled"}:
-            self._set_thinking_mode(False)
-            await self._mount_and_scroll(
-                UserCommandMessage("Thinking mode disabled.")
-            )
-            return
+    async def on_chat_input_container_plan_confirmation_accepted(
+        self, _: ChatInputContainer.PlanConfirmationAccepted
+    ) -> None:
+        await self._planner_ui.apply_choice(accept=True)
 
-        # Toggle if no argument
-        self._set_thinking_mode(not self._thinking_mode)
-        status = "enabled" if self._thinking_mode else "disabled"
-        await self._mount_and_scroll(
-            UserCommandMessage(f"Thinking mode {status}.")
-        )
+    async def on_chat_input_container_plan_confirmation_declined(
+        self, _: ChatInputContainer.PlanConfirmationDeclined
+    ) -> None:
+        await self._planner_ui.apply_choice(accept=False)
+
+    async def _toggle_thinking_mode(self, argument: str | None = None) -> None:
+        await self._command_controller.toggle_thinking_mode(argument)
 
     def _set_thinking_mode(self, enabled: bool, *, persist: bool = False) -> None:
         """Set thinking mode state and optionally persist to config."""
@@ -701,7 +724,7 @@ class VibeApp(App):
         if self._pending_approval and not self._pending_approval.done():
             self._pending_approval.set_result((ApprovalResponse.YES, None))
 
-        await self._switch_to_input_app()
+        await self._bottom_panel_manager.show_input()
 
     async def on_approval_app_approval_granted_always_tool(
         self, message: ApprovalApp.ApprovalGrantedAlwaysTool
@@ -713,7 +736,7 @@ class VibeApp(App):
         if self._pending_approval and not self._pending_approval.done():
             self._pending_approval.set_result((ApprovalResponse.YES, None))
 
-        await self._switch_to_input_app()
+        await self._bottom_panel_manager.show_input()
 
     async def on_approval_app_approval_rejected(
         self, message: ApprovalApp.ApprovalRejected
@@ -724,7 +747,7 @@ class VibeApp(App):
             )
             self._pending_approval.set_result((ApprovalResponse.NO, feedback))
 
-        await self._switch_to_input_app()
+        await self._bottom_panel_manager.show_input()
 
         if self._loading_widget and self._loading_widget.parent:
             await self._remove_loading_widget()
@@ -756,7 +779,7 @@ class VibeApp(App):
                 UserCommandMessage("Configuration closed (no changes saved).")
             )
 
-        await self._switch_to_input_app()
+        await self._bottom_panel_manager.show_input()
 
     def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
         """Handle worker state changes to propagate errors to UI."""
@@ -779,7 +802,7 @@ class VibeApp(App):
                 await self._mount_and_scroll(
                     ErrorMessage(
                         f"Background task '{worker_name}' failed: {error_msg}",
-                        collapsed=self._tools_collapsed,
+                        collapsed=self._ui_store.tools_collapsed,
                     )
                 )
                 # If it's a rate limit error, trigger the alert
@@ -838,7 +861,7 @@ class VibeApp(App):
         if not command:
             await self._mount_and_scroll(
                 ErrorMessage(
-                    "No command provided after '!'", collapsed=self._tools_collapsed
+                    "No command provided after '!'", collapsed=self._ui_store.tools_collapsed
                 )
             )
             return
@@ -874,39 +897,39 @@ class VibeApp(App):
             await self._mount_and_scroll(
                 ErrorMessage(
                     "Command timed out after 30 seconds",
-                    collapsed=self._tools_collapsed,
+                    collapsed=self._ui_store.tools_collapsed,
                 )
             )
         except Exception as e:
             await self._mount_and_scroll(
-                ErrorMessage(f"Command failed: {e}", collapsed=self._tools_collapsed)
+                ErrorMessage(f"Command failed: {e}", collapsed=self._ui_store.tools_collapsed)
             )
 
     async def _handle_user_message(self, message: str) -> None:
+        if self._app_controller:
+            await self._app_controller.handle_user_message(message)
+            return
+
+        logger.warning("App controller unavailable; falling back to direct agent call")
         init_task = self._ensure_agent_init_task()
         pending_init = bool(init_task and not init_task.done())
         user_message = UserMessage(message, pending=pending_init)
-
         await self._mount_and_scroll(user_message)
+        await self._continue_user_message(
+            message=message,
+            user_message=user_message,
+            init_task=init_task,
+            pending_init=pending_init,
+        )
 
-        if self._pending_plan_confirmation:
-            handled = await self._handle_plan_confirmation_response(message)
-            if handled:
-                return
-
-        if (
-            self._planner_auto_start
-            and not self._thinking_mode
-            and self._should_autostart_plan()
-        ):
-            plan_decision = self._assess_plan_need(message)
-            if plan_decision is PlanTriggerDecision.PLAN:
-                await self._start_planning(message)
-                return
-            if plan_decision is PlanTriggerDecision.ASK:
-                await self._prompt_for_plan_confirmation(message)
-                return
-
+    async def _continue_user_message(
+        self,
+        *,
+        message: str,
+        user_message: UserMessage,
+        init_task: asyncio.Task | None,
+        pending_init: bool,
+    ) -> None:
         thinking_outline = None
         if self._thinking_mode:
             thinking_outline = await self._generate_thinking_outline(message)
@@ -922,6 +945,16 @@ class VibeApp(App):
                 pending_init=pending_init,
             ),
             exclusive=False,
+        )
+
+    async def _continue_pending_request(
+        self, request: PendingPlanRequest
+    ) -> None:
+        await self._continue_user_message(
+            message=request.goal,
+            user_message=request.user_message,
+            init_task=request.init_task,
+            pending_init=request.pending_init,
         )
 
     async def _process_user_message_after_mount(
@@ -1003,7 +1036,7 @@ class VibeApp(App):
                 "Please check your network connection and API configuration."
             )
             await self._mount_and_scroll(
-                ErrorMessage(error_msg, collapsed=self._tools_collapsed)
+                ErrorMessage(error_msg, collapsed=self._ui_store.tools_collapsed)
             )
             # Timeout is retryable
             await self._mount_and_scroll(
@@ -1019,7 +1052,7 @@ class VibeApp(App):
             self.agent = None
             error_str = str(e)
             await self._mount_and_scroll(
-                ErrorMessage(error_str, collapsed=self._tools_collapsed)
+                ErrorMessage(error_str, collapsed=self._ui_store.tools_collapsed)
             )
             # Offer retry for retryable errors
             if self._is_retryable_error(e):
@@ -1058,7 +1091,7 @@ class VibeApp(App):
         self, tool: str, args: dict, tool_call_id: str
     ) -> tuple[ApprovalResponse, str | None]:
         self._pending_approval = asyncio.Future()
-        await self._switch_to_approval_app(tool, args)
+        await self._bottom_panel_manager.show_approval(tool, args)
         result = await self._pending_approval
         self._pending_approval = None
         return result
@@ -1096,9 +1129,8 @@ class VibeApp(App):
                         )
                     )
 
-                # Dispatch event to all registered consumers
-                if self._event_dispatcher:
-                    await self._event_dispatcher.dispatch(event)
+                # Dispatch event to all registered consumers and UI
+                await self._fan_out_event(event)
 
                 # Additional app-level event handling
                 if isinstance(event, MemoryEntryEvent):
@@ -1124,7 +1156,7 @@ class VibeApp(App):
                 self._last_failed_prompt = prompt
 
             await self._mount_and_scroll(
-                ErrorMessage(error_str, collapsed=self._tools_collapsed)
+                ErrorMessage(error_str, collapsed=self._ui_store.tools_collapsed)
             )
 
             if self._looks_like_rate_limit_error(error_str):
@@ -1203,270 +1235,34 @@ class VibeApp(App):
         self._interrupt_requested = False
 
     async def _show_help(self) -> None:
-        help_text = self.commands.get_help_text()
-        await self._mount_and_scroll(UserCommandMessage(help_text))
+        await self._command_controller.show_help()
 
     async def _start_planning(self, argument: str | None = None) -> None:
-        goal = (argument or "").strip()
-        if not goal:
-            await self._mount_and_scroll(
-                UserCommandMessage(
-                    "Usage: `/plan <goal>`\n\nExample:\n`/plan add a planning sidebar`"
-                )
-            )
-            return
-        await self._mount_and_scroll(
-            UserCommandMessage("Working on getting the subagents ready…")
-        )
-
-        planner = self._ensure_planner()
-        await self._clear_plan_cards()
-        plan_state = await planner.start_plan(goal)
-        self._update_planner_ticker(plan_state)
-        await self._refresh_planner_panel(plan_state)
-        await self._emit_plan_events(plan_state)
-        await self._mount_and_scroll(
-            UserCommandMessage(self._format_plan_summary(plan_state))
-        )
-        self._start_plan_executor(plan_state.plan_id)
+        await self._command_controller.start_planning(argument)
 
     def _should_autostart_plan(self) -> bool:
-        planner = self._planner_agent
-        if not planner:
-            return True
-        plan = planner.get_plan()
+        controller = self._planner_controller
+        if not controller:
+            return False
+        plan = controller.get_plan()
         if not plan:
             return True
         return plan.status in (PlanRunStatus.COMPLETED, PlanRunStatus.CANCELLED)
 
-    def _assess_plan_need(self, message: str) -> PlanTriggerDecision:
-        """Heuristic check to decide whether to kick off planning for a message."""
-        normalized = message.strip().lower()
-        if not normalized:
-            return PlanTriggerDecision.SKIP
-
-        action_keywords = [
-            "implement",
-            "build",
-            "refactor",
-            "migrate",
-            "create",
-            "develop",
-            "rewrite",
-            "optimize",
-            "fix",
-            "support",
-            "scaffold",
-            "automate",
-            "generate",
-            "test ",
-            "add ",
-            "remove ",
-        ]
-        question_prefixes = [
-            "describe",
-            "what",
-            "why",
-            "who",
-            "where",
-            "when",
-            "which",
-            "explain",
-            "show",
-            "list",
-            "tell me",
-            "summarize",
-        ]
-
-        contains_action_kw = any(keyword in normalized for keyword in action_keywords)
-        strong_plan_terms = [
-            "multistep",
-            "multi-step",
-            "roadmap",
-            "strategy",
-            "outline steps",
-            "execution plan",
-            "timeline",
-        ]
-        if any(term in normalized for term in strong_plan_terms):
-            return PlanTriggerDecision.PLAN
-
-        if normalized.startswith("/plan"):
-            return PlanTriggerDecision.PLAN
-
-        if any(normalized.startswith(prefix + " ") for prefix in question_prefixes):
-            if not contains_action_kw:
-                return PlanTriggerDecision.SKIP
-
-        if normalized.endswith("?") and not (
-            "how to" in normalized or "how do" in normalized or contains_action_kw
-        ):
-            return PlanTriggerDecision.SKIP
-
-        token_count = len(normalized.split())
-        bullet_points = message.count("\n-") + message.count("\n*")
-        numbered_items = bool(re.search(r"\d+\.", message))
-        conjunction_rich = normalized.count(" and ") + normalized.count(" then ")
-        plan_score = 0
-
-        if contains_action_kw:
-            plan_score += 1
-        if token_count >= 80:
-            plan_score += 2
-        elif token_count >= 40:
-            plan_score += 1
-        if bullet_points >= 2 or numbered_items:
-            plan_score += 1
-        if conjunction_rich >= 2:
-            plan_score += 1
-        if "\n" in message and len(message.splitlines()) >= 3:
-            plan_score += 1
-
-        if plan_score >= 2:
-            return PlanTriggerDecision.PLAN
-        if plan_score == 0:
-            return PlanTriggerDecision.SKIP
-        return PlanTriggerDecision.ASK
-
-    async def _prompt_for_plan_confirmation(self, goal: str) -> None:
-        self._pending_plan_confirmation = goal
-        await self._mount_and_scroll(
-            UserCommandMessage(
-                "This request might benefit from a planning session. "
-                "Reply `yes` to generate a plan with sub-agents or `no` to continue directly."
-            )
-        )
-
-    async def _handle_plan_confirmation_response(self, message: str) -> bool:
-        if not self._pending_plan_confirmation:
-            return False
-
-        response = message.strip().lower()
-        affirmative = {"y", "yes", "sure", "please", "do it", "go ahead"}
-        negative = {"n", "no", "skip", "not now", "nope"}
-
-        if response in affirmative or response.startswith("yes"):
-            goal = self._pending_plan_confirmation
-            self._pending_plan_confirmation = None
-            await self._start_planning(goal)
-            return True
-
-        if response in negative or response.startswith("no "):
-            self._pending_plan_confirmation = None
-            await self._mount_and_scroll(
-                UserCommandMessage("Okay, continuing without a planning session.")
-            )
-            return True
-
-        # Treat ambiguous responses as a new request
-        self._pending_plan_confirmation = None
-        return False
-
-    def _format_plan_summary(self, plan: PlanState) -> str:
-        status = plan.status.value.replace("_", " ").title()
-        lines = [f"### Plan: {plan.goal}", f"- Status: {status}"]
-        for step in plan.steps:
-            step_status = step.status.value.replace("_", " ").title()
-            owner = f" (owner: {step.owner})" if step.owner else ""
-            mode = f" · mode: {step.mode}" if step.mode else ""
-            lines.append(f"- [{step_status}]{owner}{mode} {step.title}")
-        if plan.decisions:
-            lines.append("")
-            lines.append("Pending decisions:")
-            for decision in plan.decisions:
-                options = ", ".join(decision.option_labels()) if decision.options else "freeform"
-                decision_status = (
-                    f"resolved: {decision.selection}" if decision.resolved else "awaiting input"
-                )
-                lines.append(
-                    f"- `{decision.decision_id}` {decision.question} ({options}) → {decision_status}"
-                )
-        return "\n".join(lines)
-
     async def _toggle_plan_auto(self, argument: str | None = None) -> None:
-        mode = (argument or "").strip().lower()
-        if mode in {"on", "true", "enable", "enabled"}:
-            self._set_planner_auto_start(True)
-            await self._mount_and_scroll(
-                UserCommandMessage(
-                    "Planner auto-start enabled. Future prompts will create a plan automatically."
-                )
-            )
-            return
-        if mode in {"off", "false", "disable", "disabled"}:
-            self._set_planner_auto_start(False)
-            await self._mount_and_scroll(
-                UserCommandMessage("Planner auto-start disabled.")
-            )
-            return
-
-        status = "enabled" if self._planner_auto_start else "disabled"
-        await self._mount_and_scroll(
-            UserCommandMessage(
-                f"Planner auto-start is currently {status}. "
-                "Use `/plan auto on` or `/plan auto off` to change."
-            )
-        )
+        await self._command_controller.toggle_plan_auto(argument)
 
     async def _show_plan_status(self, _: str | None = None) -> None:
-        if not self._planner_agent or not self._planner_agent.get_plan():
-            await self._mount_and_scroll(
-                UserCommandMessage("No active plan. Run `/plan <goal>` to start one.")
-            )
-            return
-        plan = self._planner_agent.get_plan()
-        if plan:
-            await self._mount_and_scroll(UserCommandMessage(self._format_plan_summary(plan)))
+        await self._command_controller.show_plan_status()
 
     async def _pause_plan(self, _: str | None = None) -> None:
-        if not self._planner_agent:
-            await self._mount_and_scroll(
-                UserCommandMessage("Planner is not active yet. Use `/plan <goal>` to begin.")
-            )
-            return
-        plan = self._planner_agent.pause()
-        if not plan:
-            await self._mount_and_scroll(
-                UserCommandMessage("No active plan to pause.")
-            )
-            return
-        self._cancel_plan_executor()
-        await self._refresh_planner_panel(plan)
-        self._update_planner_ticker(plan)
-        await self._mount_and_scroll(UserCommandMessage("Planning session paused."))
+        await self._command_controller.pause_plan()
 
     async def _resume_plan(self, _: str | None = None) -> None:
-        if not self._planner_agent:
-            await self._mount_and_scroll(
-                UserCommandMessage("Planner is not active yet. Use `/plan <goal>` to begin.")
-            )
-            return
-        plan = self._planner_agent.resume()
-        if not plan:
-            await self._mount_and_scroll(
-                UserCommandMessage("No paused plan to resume.")
-            )
-            return
-        await self._refresh_planner_panel(plan)
-        self._update_planner_ticker(plan)
-        await self._mount_and_scroll(UserCommandMessage("Planning session resumed."))
-        self._start_plan_executor(plan.plan_id)
+        await self._command_controller.resume_plan()
 
     async def _cancel_plan(self, _: str | None = None) -> None:
-        if not self._planner_agent or not self._planner_agent.get_plan():
-            await self._mount_and_scroll(
-                UserCommandMessage("No active plan to cancel.")
-            )
-            return
-        self._planner_agent.cancel()
-        await self._clear_plan_cards()
-        self._cancel_plan_executor()
-        # Use clear_plan to invalidate any pending updates
-        if self._sidebar:
-            self._sidebar.clear_plan()
-        await self._refresh_planner_panel(None)
-        self._update_planner_ticker(None)
-        await self._mount_and_scroll(UserCommandMessage("Planning session cancelled."))
+        await self._command_controller.cancel_plan()
 
     def _set_planner_auto_start(self, enabled: bool, *, persist: bool = True) -> None:
         self._planner_auto_start = enabled
@@ -1474,78 +1270,12 @@ class VibeApp(App):
             VibeConfig.save_updates({"planner_auto_start": enabled})
 
     async def _handle_plan_decision(self, argument: str | None = None) -> None:
-        if not self._planner_agent or not self._planner_agent.get_plan():
-            await self._mount_and_scroll(
-                UserCommandMessage("No active plan. Start one with `/plan <goal>`.")
-            )
-            return
-        if not argument:
-            await self._mount_and_scroll(
-                UserCommandMessage("Usage: `/plan decide <decision-id> <choice>`")
-            )
-            return
-        parts = argument.split()
-        if len(parts) < 2:
-            await self._mount_and_scroll(
-                UserCommandMessage("Usage: `/plan decide <decision-id> <choice>`")
-            )
-            return
-        decision_id, selection = parts[0], " ".join(parts[1:])
-        plan = self._planner_agent.decide(decision_id, selection)
-        if not plan:
-            await self._mount_and_scroll(
-                UserCommandMessage(f"Unknown decision `{decision_id}`.")
-            )
-            return
-        await self._refresh_planner_panel(plan)
-        self._update_planner_ticker(plan)
-        await self._mount_and_scroll(
-            UserCommandMessage(f"Decision `{decision_id}` recorded: {selection}")
-        )
-        decision = next(
-            (item for item in plan.decisions if item.decision_id == decision_id),
-            None,
-        )
-        if decision:
-            await self._emit_decision_event(plan, decision)
-        self._start_plan_executor(plan.plan_id)
+        await self._command_controller.handle_plan_decision(argument)
 
     async def on_plan_decision_message_decision_selected(
         self, message: PlanDecisionMessage.DecisionSelected
     ) -> None:
-        selections = [s.strip() for s in message.selections if s.strip()]
-        if not selections:
-            return
-        await self._handle_plan_decision_selections(message.decision_id, selections)
-
-    async def _handle_plan_decision_selections(
-        self, decision_id: str, selections: list[str]
-    ) -> None:
-        """Handle decision selections from the new form widget."""
-        if not self._planner_agent or not self._planner_agent.get_plan():
-            await self._mount_and_scroll(
-                UserCommandMessage("No active plan. Start one with `/plan <goal>`.")
-            )
-            return
-        plan = self._planner_agent.decide(decision_id, selections)
-        if not plan:
-            await self._mount_and_scroll(
-                UserCommandMessage(f"Unknown decision `{decision_id}`.")
-            )
-            return
-        await self._refresh_planner_panel(plan)
-        self._update_planner_ticker(plan)
-        selections_text = ", ".join(selections)
-        await self._mount_and_scroll(
-            UserCommandMessage(f"Decision `{decision_id}` recorded: {selections_text}")
-        )
-        decision = next(
-            (item for item in plan.decisions if item.decision_id == decision_id),
-            None,
-        )
-        if decision:
-            await self._emit_decision_event(plan, decision)
-        self._start_plan_executor(plan.plan_id)
+        await self._command_controller.handle_plan_decision_selections(message)
 
     async def _emit_plan_events(self, plan: PlanState, include_summary: bool = True) -> None:
         if include_summary:
@@ -1633,327 +1363,60 @@ class VibeApp(App):
         await self._mount_and_scroll(message)
         self._update_planner_ticker()
 
-    async def _show_status(self) -> None:
-        if self.agent is None:
-            await self._mount_and_scroll(
-                ErrorMessage(
-                    "Agent not initialized yet. Send a message first.",
-                    collapsed=self._tools_collapsed,
-                )
+    async def _notify_step_decision_needed(
+        self, plan: PlanState, step: PlanStep
+    ) -> None:
+        decision_id = step.decision_id
+        if decision_id:
+            decision = next(
+                (item for item in plan.decisions if item.decision_id == decision_id),
+                None,
             )
-            return
+            if decision:
+                await self._emit_decision_event(plan, decision)
+                return
+        await self._mount_and_scroll(
+            UserCommandMessage(
+                f"Planner step `{step.step_id}` requires decision "
+                f"`{decision_id or 'unknown'}`. Use `/plan decide <id> <choice>` "
+                "to continue."
+            )
+        )
 
-        stats = self.agent.stats
-        status_text = f"""## Agent Statistics
+    async def _planner_append_message(self, text: str) -> None:
+        await self._mount_and_scroll(UserCommandMessage(text))
 
-- **Steps**: {stats.steps:,}
-- **Session Prompt Tokens**: {stats.session_prompt_tokens:,}
-- **Session Completion Tokens**: {stats.session_completion_tokens:,}
-- **Session Total LLM Tokens**: {stats.session_total_llm_tokens:,}
-- **Last Turn Tokens**: {stats.last_turn_total_tokens:,}
-- **Cost**: ${stats.session_cost:.4f}
-"""
-        await self._mount_and_scroll(UserCommandMessage(status_text))
+    def _set_active_plan_step(self, step_id: str | None, mode: str | None) -> None:
+        if self._sidebar:
+            self._sidebar.set_active_step(step_id, mode)
+
+    async def _show_status(self) -> None:
+        await self._command_controller.show_status()
 
     async def _show_config(self) -> None:
-        """Switch to the configuration app in the bottom panel."""
-        if self._current_bottom_app == BottomApp.Config:
-            return
-        await self._switch_to_config_app()
+        await self._command_controller.show_config()
 
     async def _reload_config(self) -> None:
-        try:
-            # Run config loading in thread pool to avoid blocking on file I/O
-            new_config = await asyncio.to_thread(VibeConfig.load)
-
-            if self.agent:
-                await self.agent.reload_with_initial_messages(config=new_config)
-
-            self.config = new_config
-            self._planner_auto_start = new_config.planner_auto_start
-            if self.config.auto_compact_threshold > 0:
-                current_tokens = (
-                    self.agent.stats.context_tokens if self.agent else 0
-                )
-                self._set_context_tokens(
-                    TokenState(
-                        max_tokens=self.config.auto_compact_threshold,
-                        current_tokens=current_tokens,
-                        soft_limit_ratio=self.config.memory_soft_limit_ratio,
-                    )
-                )
-            else:
-                self._set_context_tokens(TokenState())
-
-            await self._refresh_memory_panel()
-            await self._mount_and_scroll(UserCommandMessage("Configuration reloaded."))
-        except Exception as e:
-            await self._mount_and_scroll(
-                ErrorMessage(
-                    f"Failed to reload config: {e}", collapsed=self._tools_collapsed
-                )
-            )
+        await self._command_controller.reload_config()
 
     async def _clear_history(self) -> None:
-        if self.agent is None:
-            await self._mount_and_scroll(
-                ErrorMessage(
-                    "No conversation history to clear yet.",
-                    collapsed=self._tools_collapsed,
-                )
-            )
-            return
-
-        if not self.agent:
-            return
-
-        try:
-            await self.agent.clear_history()
-            await self._refresh_memory_panel()
-            await self._finalize_current_streaming_message()
-            if self.event_handler:
-                self.event_handler.reset()
-            messages_area = self.query_one("#messages")
-            await messages_area.remove_children()
-            # Clear todos in sidebar
-            if self._sidebar:
-                self._sidebar.update_todos([])
-
-            if self.agent:
-                current_state = self._current_token_state
-                self._set_context_tokens(
-                    TokenState(
-                        max_tokens=current_state.max_tokens,
-                        current_tokens=self.agent.stats.context_tokens,
-                        soft_limit_ratio=current_state.soft_limit_ratio
-                        or self.config.memory_soft_limit_ratio,
-                    )
-                )
-            await self._mount_and_scroll(
-                UserCommandMessage("Conversation history cleared!")
-            )
-            chat = self.query_one("#chat", VerticalScroll)
-            chat.scroll_home(animate=False)
-
-        except Exception as e:
-            await self._mount_and_scroll(
-                ErrorMessage(
-                    f"Failed to clear history: {e}", collapsed=self._tools_collapsed
-                )
-            )
+        await self._command_controller.clear_history()
 
     async def _show_log_path(self) -> None:
-        if self.agent is None:
-            await self._mount_and_scroll(
-                ErrorMessage(
-                    "No log file created yet. Send a message first.",
-                    collapsed=self._tools_collapsed,
-                )
-            )
-            return
-
-        if not self.agent.interaction_logger.enabled:
-            await self._mount_and_scroll(
-                ErrorMessage(
-                    "Session logging is disabled in configuration.",
-                    collapsed=self._tools_collapsed,
-                )
-            )
-            return
-
-        try:
-            log_path = str(self.agent.interaction_logger.filepath)
-            await self._mount_and_scroll(
-                UserCommandMessage(
-                    f"## Current Log File Path\n\n`{log_path}`\n\nYou can send this file to share your interaction."
-                )
-            )
-        except Exception as e:
-            await self._mount_and_scroll(
-                ErrorMessage(
-                    f"Failed to get log path: {e}", collapsed=self._tools_collapsed
-                )
-            )
+        await self._command_controller.show_log_path()
 
     async def _compact_history(self) -> None:
-        if self._agent_running:
-            await self._mount_and_scroll(
-                ErrorMessage(
-                    "Cannot compact while agent is processing. Please wait.",
-                    collapsed=self._tools_collapsed,
-                )
-            )
-            return
-
-        if self.agent is None:
-            await self._mount_and_scroll(
-                ErrorMessage(
-                    "No conversation history to compact yet.",
-                    collapsed=self._tools_collapsed,
-                )
-            )
-            return
-
-        if len(self.agent.messages) <= 1:
-            await self._mount_and_scroll(
-                ErrorMessage(
-                    "No conversation history to compact yet.",
-                    collapsed=self._tools_collapsed,
-                )
-            )
-            return
-
-        if not self.agent or not self.event_handler:
-            return
-
-        old_tokens = self.agent.stats.context_tokens
-        compact_msg = CompactMessage()
-        self.event_handler.current_compact = compact_msg
-        await self._mount_and_scroll(compact_msg)
-
-        try:
-            await self.agent.compact()
-            await self._refresh_memory_panel()
-            new_tokens = self.agent.stats.context_tokens
-            compact_msg.set_complete(old_tokens=old_tokens, new_tokens=new_tokens)
-            self.event_handler.current_compact = None
-
-            current_state = self._current_token_state
-            self._set_context_tokens(
-                TokenState(
-                    max_tokens=current_state.max_tokens,
-                    current_tokens=new_tokens,
-                    soft_limit_ratio=current_state.soft_limit_ratio
-                    or self.config.memory_soft_limit_ratio,
-                )
-            )
-        except Exception as e:
-            compact_msg.set_error(str(e))
-            self.event_handler.current_compact = None
+        await self._command_controller.compact_history()
 
     async def _exit_app(self) -> None:
-        self.exit()
-
-    async def _switch_to_config_app(self) -> None:
-        if self._current_bottom_app == BottomApp.Config:
-            return
-
-        bottom_container = self.query_one("#bottom-app-container")
-        await self._mount_and_scroll(UserCommandMessage("Configuration opened..."))
-
-        try:
-            chat_input_container = self.query_one(ChatInputContainer)
-            await chat_input_container.remove()
-        except Exception:
-            pass
-
-        if self._mode_indicator:
-            self._mode_indicator.display = False
-
-        config_app = ConfigApp(self.config)
-        await bottom_container.mount(config_app)
-        self._current_bottom_app = BottomApp.Config
-
-        self.call_after_refresh(config_app.focus)
-
-    async def _switch_to_approval_app(self, tool_name: str, tool_args: dict) -> None:
-        bottom_container = self.query_one("#bottom-app-container")
-
-        try:
-            chat_input_container = self.query_one(ChatInputContainer)
-            await chat_input_container.remove()
-        except Exception:
-            pass
-
-        if self._mode_indicator:
-            self._mode_indicator.display = False
-
-        approval_app = ApprovalApp(
-            tool_name=tool_name,
-            tool_args=tool_args,
-            workdir=str(self.config.effective_workdir),
-            config=self.config,
-        )
-        await bottom_container.mount(approval_app)
-        self._current_bottom_app = BottomApp.Approval
-
-        self.call_after_refresh(approval_app.focus)
-        self.call_after_refresh(self._scroll_to_bottom)
-
-    async def _switch_to_input_app(self) -> None:
-        bottom_container = self.query_one("#bottom-app-container")
-
-        try:
-            config_app = self.query_one("#config-app")
-            await config_app.remove()
-        except Exception:
-            pass
-
-        try:
-            approval_app = self.query_one("#approval-app")
-            await approval_app.remove()
-        except Exception:
-            pass
-
-        if self._mode_indicator:
-            self._mode_indicator.display = True
-
-        try:
-            chat_input_container = self.query_one(ChatInputContainer)
-            self._chat_input_container = chat_input_container
-            self._current_bottom_app = BottomApp.Input
-            self.call_after_refresh(chat_input_container.focus_input)
-            return
-        except Exception:
-            pass
-
-        chat_input_container = ChatInputContainer(
-            history_file=self.history_file,
-            command_registry=self.commands,
-            id="input-container",
-            show_warning=self.auto_approve,
-        )
-        await bottom_container.mount(chat_input_container)
-        self._chat_input_container = chat_input_container
-
-        self._current_bottom_app = BottomApp.Input
-
-        self.call_after_refresh(chat_input_container.focus_input)
-
-    def _focus_current_bottom_app(self) -> None:
-        try:
-            match self._current_bottom_app:
-                case BottomApp.Input:
-                    self.query_one(ChatInputContainer).focus_input()
-                case BottomApp.Config:
-                    self.query_one(ConfigApp).focus()
-                case BottomApp.Approval:
-                    self.query_one(ApprovalApp).focus()
-                case app:
-                    assert_never(app)
-        except Exception:
-            pass
+        await self._command_controller.exit_app()
 
     def action_interrupt(self) -> None:
         if self._memory_panel and self._memory_panel.is_visible:
             self._memory_panel.hide_panel()
-            self._focus_current_bottom_app()
+            self._bottom_panel_manager.focus_current()
             return
-
-        if self._current_bottom_app == BottomApp.Config:
-            try:
-                config_app = self.query_one(ConfigApp)
-                config_app.action_close()
-            except Exception:
-                pass
-            return
-
-        if self._current_bottom_app == BottomApp.Approval:
-            try:
-                approval_app = self.query_one(ApprovalApp)
-                approval_app.action_reject()
-            except Exception:
-                pass
+        if self._bottom_panel_manager.handle_interrupt():
             return
 
         has_pending_user_message = any(
@@ -1970,13 +1433,14 @@ class VibeApp(App):
             self.run_worker(self._interrupt_agent(), exclusive=False)
 
         self._scroll_to_bottom()
-        self._focus_current_bottom_app()
+        self._bottom_panel_manager.focus_current()
 
     async def action_toggle_tool(self) -> None:
         if not self.event_handler:
             return
 
-        self._tools_collapsed = not self._tools_collapsed
+        new_value = not self._ui_store.tools_collapsed
+        self._ui_store.set_tools_collapsed(new_value)
 
         non_todo_results = [
             result
@@ -1985,13 +1449,13 @@ class VibeApp(App):
         ]
 
         for result in non_todo_results:
-            result.collapsed = self._tools_collapsed
+            result.collapsed = self._ui_store.tools_collapsed
             await result.render_result()
 
         try:
             error_messages = self.query(ErrorMessage)
             for error_msg in error_messages:
-                error_msg.set_collapsed(self._tools_collapsed)
+                error_msg.set_collapsed(self._ui_store.tools_collapsed)
         except Exception:
             pass
 
@@ -1999,7 +1463,8 @@ class VibeApp(App):
         if not self.event_handler:
             return
 
-        self._todos_collapsed = not self._todos_collapsed
+        new_value = not self._ui_store.todos_collapsed
+        self._ui_store.set_todos_collapsed(new_value)
 
         todo_results = [
             result
@@ -2008,11 +1473,11 @@ class VibeApp(App):
         ]
 
         for result in todo_results:
-            result.collapsed = self._todos_collapsed
+            result.collapsed = self._ui_store.todos_collapsed
             await result.render_result()
 
     def action_cycle_mode(self) -> None:
-        if self._current_bottom_app != BottomApp.Input:
+        if self._ui_store.bottom_panel_mode != BottomPanelMode.INPUT:
             return
 
         self.auto_approve = not self.auto_approve
@@ -2031,7 +1496,7 @@ class VibeApp(App):
             else:
                 self.agent.approval_callback = self._approval_callback
 
-        self._focus_current_bottom_app()
+        self._bottom_panel_manager.focus_current()
 
     def action_force_quit(self) -> None:
         if copy_selection_to_clipboard(self):
@@ -2277,7 +1742,7 @@ class VibeApp(App):
                 await self._mount_and_scroll(
                     ErrorMessage(
                         "Session memory is unavailable until the agent starts.",
-                        collapsed=self._tools_collapsed,
+                        collapsed=self._ui_store.tools_collapsed,
                     )
                 )
             return
@@ -2305,41 +1770,6 @@ class VibeApp(App):
         """
         copy_selection_to_clipboard(self)
 
-    def _ensure_planner(self) -> PlannerAgent:
-        if not self._planner_agent:
-            self._planner_agent = PlannerAgent(self.config)
-        return self._planner_agent
-
-    def _planner_workspace_slug(self) -> str:
-        workdir = str(self.config.effective_workdir.resolve())
-        safe_name = re.sub(
-            r"[^a-zA-Z0-9_-]", "-", self.config.effective_workdir.name or "workspace"
-        ).strip("-")
-        if not safe_name:
-            safe_name = "workspace"
-        digest = hashlib.sha256(workdir.encode("utf-8")).hexdigest()[:10]
-        return f"{safe_name.lower()}-{digest}"
-
-    def _build_plan_state_path(self) -> Path:
-        return Path.home() / ".vibe" / "plans" / f"{self._planner_workspace_slug()}.json"
-
-    def _plan_payload_owned_by_self(self, payload: dict[str, Any]) -> bool:
-        owner_id = payload.get("owner_instance_id")
-        return not owner_id or owner_id == self._planner_instance_id
-
-    def _is_pid_active(self, pid: int | None) -> bool:
-        if not pid or pid < 0:
-            return False
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        except OSError:
-            return False
-        return True
-
     async def _clear_plan_cards(self) -> None:
         for message in list(self._plan_step_cards.values()):
             try:
@@ -2362,218 +1792,10 @@ class VibeApp(App):
         # Update sidebar plan panel
         if self._sidebar:
             self._sidebar.update_plan(plan)
-        await self._persist_plan_state_async()
-
-    def _start_plan_executor(self, plan_id: str) -> None:
-        # Cancel any existing executor first and wait for it
-        self._cancel_plan_executor()
-        # Start new executor
-        worker = self.run_worker(
-            self._execute_plan_steps(plan_id),
-            exclusive=False,
-            name=f"plan-executor-{plan_id}",
-        )
-        self._plan_executor_worker = worker
-        self._plan_executor_plan_id = plan_id
-
-    def _cancel_plan_executor(self) -> None:
-        worker = self._plan_executor_worker
-        if worker:
-            # Cancel the worker
-            worker.cancel()
-            # Clear references immediately to prevent new operations
-            self._plan_executor_worker = None
-            self._plan_executor_plan_id = None
-            # Log if worker didn't stop cleanly
-            if not worker.is_cancelled and not worker.is_finished:
-                logger.warning(
-                    "Plan executor worker %s still running after cancel",
-                    worker.name,
-                )
-        else:
-            self._plan_executor_worker = None
-            self._plan_executor_plan_id = None
-        # Schedule async persist without blocking
-        self.call_later(self._persist_plan_state_async)
-
-    async def _persist_plan_state_async(self) -> None:
-        """Async version of plan state persistence - runs I/O in thread pool."""
-        await asyncio.to_thread(self._persist_plan_state_sync)
-
-    def _persist_plan_state_sync(self) -> None:
-        """Synchronous plan state persistence - called from thread pool."""
-        plan_data = None
-        if self._planner_agent:
-            plan_data = self._planner_agent.to_dict()
-        if plan_data:
-            payload = {
-                "owner_instance_id": self._planner_instance_id,
-                "owner_pid": os.getpid(),
-                "plan": plan_data,
-            }
-            try:
-                self._plan_state_file.parent.mkdir(parents=True, exist_ok=True)
-                self._plan_state_file.write_text(
-                    json.dumps(payload, indent=2), encoding="utf-8"
-                )
-            except Exception as exc:
-                logger.debug("Failed to persist plan state", exc_info=exc)
-            return
-
-        if not self._plan_state_file.exists():
-            return
-
-        try:
-            payload = json.loads(self._plan_state_file.read_text(encoding="utf-8"))
-        except Exception:
-            payload = None
-
-        if payload and not self._plan_payload_owned_by_self(payload):
-            return
-
-        try:
-            self._plan_state_file.unlink()
-        except Exception:
-            pass
-
-    async def _execute_plan_steps(self, plan_id: str) -> None:
-        while True:
-            planner = self._planner_agent
-            if not planner:
-                return
-            plan = planner.get_plan()
-            if not plan or plan.plan_id != plan_id:
-                return
-            if plan.status in (PlanRunStatus.PAUSED, PlanRunStatus.CANCELLED):
-                return
-
-            # Get steps that can run in parallel (pending with satisfied dependencies)
-            parallel_steps = planner.get_parallel_runnable_steps()
-
-            # Filter out steps that need decisions or are blocked
-            executable_steps = [
-                step for step in parallel_steps
-                if step.status not in (PlanStepStatus.NEEDS_DECISION, PlanStepStatus.BLOCKED)
-            ]
-
-            # Handle decision-blocked steps
-            for step in parallel_steps:
-                if step.status == PlanStepStatus.NEEDS_DECISION:
-                    await self._notify_step_decision_needed(step)
-
-            if not executable_steps:
-                # Check if any steps are still runnable (in_progress)
-                runnable = planner.get_runnable_steps()
-                in_progress = [s for s in runnable if s.status == PlanStepStatus.IN_PROGRESS]
-                if not in_progress and not parallel_steps:
-                    await self._maybe_mark_plan_complete(plan_id)
-                    return
-                # Wait for step update using Condition to prevent missed signals
-                if self._step_update_condition:
-                    async with self._step_update_condition:
-                        # Check if update already pending before waiting
-                        if not self._step_update_pending:
-                            try:
-                                # Wait up to 5 seconds for a step update
-                                await asyncio.wait_for(
-                                    self._step_update_condition.wait(), timeout=5.0
-                                )
-                            except asyncio.TimeoutError:
-                                pass  # Timeout is fine, we'll re-check the conditions
-                        # Clear the pending flag after processing
-                        self._step_update_pending = False
-                else:
-                    await asyncio.sleep(0.1)
-                continue
-
-            # Execute steps in parallel if multiple are available
-            if len(executable_steps) > 1:
-                await self._mount_and_scroll(
-                    UserCommandMessage(
-                        f"Executing {len(executable_steps)} steps in parallel: "
-                        + ", ".join(f"`{s.step_id}`" for s in executable_steps)
-                    )
-                )
-                await self._wait_for_agent_idle()
-
-                # Execute all steps in parallel
-                tasks = [
-                    self._execute_single_step(step, planner, plan_id)
-                    for step in executable_steps
-                ]
-                try:
-                    await asyncio.gather(*tasks)
-                except asyncio.CancelledError:
-                    return
-            else:
-                # Execute single step
-                step = executable_steps[0]
-                await self._execute_single_step(step, planner, plan_id)
-
-            await asyncio.sleep(0)
-
-    async def _execute_single_step(
-        self, step: PlanStep, planner: PlannerAgent, plan_id: str
-    ) -> None:
-        """Execute a single plan step using SubAgent."""
-        plan = planner.get_plan()
-        if not plan or plan.status in (PlanRunStatus.PAUSED, PlanRunStatus.CANCELLED):
-            return
-
-        await self._update_step_status(step.step_id, PlanStepStatus.IN_PROGRESS)
-
-        # Set active step indicator in sidebar
-        if self._sidebar:
-            self._sidebar.set_active_step(step.step_id, step.mode)
-
-        prompt = planner.build_step_prompt(step.step_id)
-        if not prompt:
-            await self._update_step_status(
-                step.step_id,
-                PlanStepStatus.BLOCKED,
-                notes="Planner missing instructions for this step.",
-            )
-            if self._sidebar:
-                self._sidebar.set_active_step(None)
-            return
-
-        await self._mount_and_scroll(
-            UserCommandMessage(
-                f"Planner executing step `{step.step_id}` · {step.title} (SubAgent: {step.mode or 'code'})"
-            )
-        )
-
-        # Execute using isolated SubAgent
-        try:
-            result = await self._execute_step_with_subagent(step, prompt)
-
-            if result.success:
-                await self._update_step_status(
-                    step.step_id,
-                    PlanStepStatus.COMPLETED,
-                    notes=f"Completed in {result.stats.duration_seconds:.1f}s, "
-                    f"{result.stats.total_tokens} tokens",
-                )
-            else:
-                await self._update_step_status(
-                    step.step_id,
-                    PlanStepStatus.BLOCKED,
-                    notes=result.error or "SubAgent execution failed",
-                )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.warning("SubAgent execution failed", exc_info=exc)
-            await self._update_step_status(
-                step.step_id,
-                PlanStepStatus.BLOCKED,
-                notes=f"Error: {exc}",
-            )
-
-        # Clear active step indicator after completion
-        if self._sidebar:
-            self._sidebar.set_active_step(None)
-        await self._maybe_mark_plan_complete(plan_id)
+        status = plan.status if plan else PlanRunStatus.IDLE
+        goal = plan.goal if plan else None
+        self._ui_store.set_plan_status(status, goal)
+        self._update_planner_ticker(plan)
 
     async def _wait_for_agent_idle(self, timeout: float = 60.0) -> None:
         """Wait for the agent to become idle using event-based signaling.
@@ -2628,6 +1850,14 @@ class VibeApp(App):
         base_system_prompt = get_universal_system_prompt(tool_manager, self.config)
 
         # Create SubAgent
+        logger.info(
+            "planner.subagent_start",
+            extra={
+                "step_id": step.step_id,
+                "title": step.title,
+                "mode": step.mode or "code",
+            },
+        )
         subagent = SubAgent(
             config=self.config,
             subagent_config=subagent_config,
@@ -2644,131 +1874,29 @@ class VibeApp(App):
 
         try:
             async for event in subagent.execute(prompt):
-                # Dispatch events to all registered consumers
-                if self._event_dispatcher:
-                    await self._event_dispatcher.dispatch(event)
+                # Dispatch events to all registered consumers and UI
+                await self._fan_out_event(event)
         finally:
             await self._detach_loading_widget(loading)
 
-        return subagent.get_result()
-
-    async def _update_step_status(
-        self, step_id: str, status: PlanStepStatus, notes: str | None = None
-    ) -> None:
-        if not self._planner_agent:
-            return
-        step = self._planner_agent.update_step_status(step_id, status, notes)
-        if not step:
-            return
-        plan = self._planner_agent.get_plan()
-        await self._refresh_planner_panel(plan)
-        if plan:
-            await self._emit_step_update_message(plan, step)
-        # Signal step update for event-based waiting
-        self._signal_step_update()
-
-    async def _notify_step_decision_needed(self, step: PlanStep) -> None:
-        decision_id = step.decision_id
-        plan = self._planner_agent.get_plan() if self._planner_agent else None
-        if plan and decision_id:
-            decision = next(
-                (item for item in plan.decisions if item.decision_id == decision_id),
-                None,
-            )
-            if decision:
-                await self._emit_decision_event(plan, decision)
-                return
-        await self._mount_and_scroll(
-            UserCommandMessage(
-                f"Planner step `{step.step_id}` requires decision "
-                f"`{decision_id or 'unknown'}`. Use `/plan decide <id> <choice>` "
-                "to continue."
-            )
+        result = subagent.get_result()
+        stats = result.stats
+        logger.info(
+            "planner.subagent_complete",
+            extra={
+                "step_id": result.step_id,
+                "success": result.success,
+                "tokens": stats.total_tokens,
+                "duration": stats.duration_seconds,
+                "artifacts": len(result.artifacts),
+            },
         )
-
-    async def _emit_step_update_message(self, plan: PlanState, step: PlanStep) -> None:
-        await self._mount_or_update_step_card(plan, step)
-
-    async def _maybe_mark_plan_complete(self, plan_id: str) -> None:
-        if not self._planner_agent:
-            return
-        plan = self._planner_agent.complete_if_possible()
-        if not plan or plan.plan_id != plan_id:
-            return
-        if plan.status == PlanRunStatus.COMPLETED:
-            await self._refresh_planner_panel(plan)
-            await self._mount_and_scroll(
-                UserCommandMessage(f"Planner goal '{plan.goal}' completed.")
-            )
-            self._cancel_plan_executor()
-            await self._clear_plan_cards()
-            await self._persist_plan_state_async()
-            self._update_planner_ticker(plan)
+        return result
 
     async def _load_plan_state(self) -> None:
-        # Only load plan state if resuming a session
-        if self._session_info is None:
-            # Starting fresh - clear any old plan state
-            if self._plan_state_file.exists():
-                try:
-                    self._plan_state_file.unlink()
-                except Exception:
-                    pass
+        if not self._planner_controller:
             return
-
-        try:
-            self._plan_state_file.parent.mkdir(parents=True, exist_ok=True)
-        except Exception as exc:
-            logger.debug("Failed to ensure planner state directory", exc_info=exc)
-            return
-
-        if not self._plan_state_file.exists():
-            return
-
-        try:
-            raw_payload = json.loads(self._plan_state_file.read_text(encoding="utf-8"))
-        except Exception as exc:
-            logger.debug("Failed to read planner state", exc_info=exc)
-            return
-
-        payload = raw_payload if isinstance(raw_payload, dict) else {}
-        plan_data = payload.get("plan")
-        if plan_data is None:
-            plan_data = raw_payload if isinstance(raw_payload, dict) else None
-        if not isinstance(plan_data, dict):
-            return
-
-        owner_id = payload.get("owner_instance_id")
-        owner_pid = payload.get("owner_pid")
-        if owner_id and owner_id != self._planner_instance_id:
-            if self._is_pid_active(owner_pid):
-                logger.debug(
-                    "Planner state is owned by another active instance (pid=%s)",
-                    owner_pid,
-                )
-                return
-
-        planner = self._ensure_planner()
-        try:
-            plan = planner.load_from_dict(plan_data)
-        except Exception as exc:
-            logger.debug("Failed to deserialize planner state", exc_info=exc)
-            return
-
-        await self._refresh_planner_panel(plan)
-        await self._mount_and_scroll(
-            UserCommandMessage(
-                f"Restored planning session '{plan.goal}' "
-                f"({plan.status.value.replace('_', ' ').title()})."
-            )
-        )
-        await self._clear_plan_cards()
-        await self._emit_plan_events(plan, include_summary=False)
-        self._update_planner_ticker(plan)
-        if not self._plan_payload_owned_by_self(payload):
-            await self._persist_plan_state_async()
-        if plan.status == PlanRunStatus.ACTIVE:
-            self._start_plan_executor(plan.plan_id)
+        await self._planner_controller.load_plan_state(self._session_info)
 
 
 def run_textual_ui(

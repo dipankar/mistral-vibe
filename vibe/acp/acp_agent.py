@@ -66,6 +66,7 @@ from vibe.core.types import (
     ToolResultEvent,
 )
 from vibe.core.utils import CancellationReason, get_user_cancellation_message
+from vibe.ipc.event_bus import EventBusPublisher, default_event_bus_config
 
 
 class AcpSession(BaseModel):
@@ -74,6 +75,7 @@ class AcpSession(BaseModel):
     agent: VibeAgent
     mode_id: VibeSessionMode = VibeSessionMode.APPROVAL_REQUIRED
     task: asyncio.Task[None] | None = None
+    event_bus: EventBusPublisher | None = None
 
 
 class VibeAcpAgent(AcpAgent):
@@ -81,6 +83,11 @@ class VibeAcpAgent(AcpAgent):
         self.sessions: dict[str, AcpSession] = {}
         self.connection = connection
         self.client_capabilities = None
+
+    def __del__(self) -> None:  # pragma: no cover - best-effort cleanup
+        for session in self.sessions.values():
+            if session.event_bus:
+                session.event_bus.close()
 
     @override
     async def initialize(self, params: InitializeRequest) -> InitializeResponse:
@@ -166,11 +173,13 @@ class VibeAcpAgent(AcpAgent):
             }) from e
 
         agent = VibeAgent(config=config, auto_approve=False, enable_streaming=True)
+        bus_config = default_event_bus_config(Path(params.cwd))
+        event_bus = EventBusPublisher(bus_config)
         # NOTE: For now, we pin session.id to agent.session_id right after init time.
         # We should just use agent.session_id everywhere, but it can still change during
         # session lifetime (e.g. agent.compact is called).
         # We should refactor agent.session_id to make it immutable in ACP context.
-        session = AcpSession(id=agent.session_id, agent=agent)
+        session = AcpSession(id=agent.session_id, agent=agent, event_bus=event_bus)
         self.sessions[session.id] = session
 
         if not agent.auto_approve:
@@ -403,7 +412,10 @@ class VibeAcpAgent(AcpAgent):
         rendered_prompt = render_path_prompt(
             prompt, base_dir=session.agent.config.effective_workdir
         )
+        event_bus = session.event_bus
         async for event in session.agent.act(rendered_prompt):
+            if event_bus:
+                await event_bus.publish(event)
             if isinstance(event, AssistantEvent):
                 yield AgentMessageChunk(
                     sessionUpdate="agent_message_chunk",

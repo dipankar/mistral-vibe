@@ -24,6 +24,7 @@ from vibe.core.types import (
     ToolCallEvent,
     ToolResultEvent,
 )
+from vibe.ipc.event_bus import EventBusPublisher
 
 if TYPE_CHECKING:
     pass
@@ -38,8 +39,9 @@ class EventDispatcher(IEventDispatcher):
     registered consumers. Errors in one consumer don't affect others.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, event_bus: EventBusPublisher | None = None) -> None:
         self._consumers: list[IEventConsumer] = []
+        self._event_bus = event_bus
 
     def add_consumer(self, consumer: IEventConsumer) -> None:
         """Register an event consumer."""
@@ -76,6 +78,9 @@ class EventDispatcher(IEventDispatcher):
                     type(consumer).__name__,
                     e,
                 )
+
+        if self._event_bus:
+            await self._event_bus.publish(event)
 
     async def _dispatch_to_consumer(
         self, consumer: IEventConsumer, event: BaseEvent
@@ -115,8 +120,8 @@ class FilteringEventDispatcher(EventDispatcher):
     reducing unnecessary handler calls.
     """
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, *, event_bus: EventBusPublisher | None = None) -> None:
+        super().__init__(event_bus=event_bus)
         self._filters: dict[IEventConsumer, set[type[BaseEvent]] | None] = {}
 
     def add_consumer(
@@ -161,3 +166,5 @@ class FilteringEventDispatcher(EventDispatcher):
                     type(consumer).__name__,
                     e,
                 )
+        if self._event_bus:
+            await self._event_bus.publish(event)

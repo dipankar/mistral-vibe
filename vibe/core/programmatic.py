@@ -7,6 +7,7 @@ from vibe.core.config import VibeConfig
 from vibe.core.output_formatters import create_formatter
 from vibe.core.types import AssistantEvent, LLMMessage, OutputFormat, Role
 from vibe.core.utils import ConversationLimitException, logger
+from vibe.ipc.event_bus import EventBusPublisher, default_event_bus_config
 
 
 def run_programmatic(
@@ -33,6 +34,9 @@ def run_programmatic(
         The final assistant response text, or None if no response
     """
     formatter = create_formatter(output_format)
+    event_bus = EventBusPublisher(
+        default_event_bus_config(config.effective_workdir)
+    )
 
     agent = Agent(
         config,
@@ -56,9 +60,13 @@ def run_programmatic(
 
         async for event in agent.act(prompt):
             formatter.on_event(event)
+            await event_bus.publish(event)
             if isinstance(event, AssistantEvent) and event.stopped_by_middleware:
                 raise ConversationLimitException(event.content)
 
         return formatter.finalize()
 
-    return asyncio.run(_async_run())
+    try:
+        return asyncio.run(_async_run())
+    finally:
+        event_bus.close()

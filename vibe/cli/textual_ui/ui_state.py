@@ -27,12 +27,12 @@ class UIState(IUIState):
     @property
     def tools_collapsed(self) -> bool:
         """Whether tool results should render collapsed by default."""
-        return self._app._tools_collapsed
+        return self._app.ui_store.tools_collapsed
 
     @property
     def todos_collapsed(self) -> bool:
         """Whether todo results should render collapsed by default."""
-        return self._app._todos_collapsed
+        return self._app.ui_store.todos_collapsed
 
     @property
     def streaming_enabled(self) -> bool:

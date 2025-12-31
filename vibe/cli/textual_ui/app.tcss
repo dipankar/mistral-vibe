@@ -1,6 +1,12 @@
 Screen {
     background: $background;
-    layout: horizontal;
+    layout: vertical;
+}
+
+#app-root {
+    width: 1fr;
+    height: 1fr;
+    layout: vertical;
 }
 
 #app-layout {
@@ -24,7 +30,6 @@ Screen {
     background: $background-darken-2;
     layout: vertical;
     border: round $foreground-muted;
-    dock: right;
 }
 
 #todo-section {
@@ -210,6 +215,35 @@ Screen {
     background: $background-darken-1;
 }
 
+#plan-confirmation-prompt {
+    border: round $foreground-muted;
+    padding: 1;
+    margin: 0 0 1 0;
+    background: $surface;
+}
+
+.plan-confirmation-text {
+    color: $text;
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+.plan-confirmation-buttons {
+    width: 100%;
+    layout: vertical;
+}
+
+.plan-confirmation-button {
+    width: 100%;
+    margin-right: 0;
+    padding: 1;
+}
+
+.plan-confirmation-help {
+    margin-top: 1;
+    color: $text-muted;
+}
+
 .plan-decision-controls {
     margin-top: 1;
 }
@@ -295,16 +329,17 @@ Screen {
     layout: horizontal;
 }
 
-#spacer {
-    width: 1fr;
-    height: auto;
-    background: transparent;
+.path-display {
+    max-width: 40;
+    overflow-x: hidden;
 }
 
 #planner-ticker {
+    width: 1fr;
+    min-width: 20;
     padding: 0 1 0 0;
     color: $text-muted;
-    text-align: right;
+    text-align: left;
 }
 
 #messages {

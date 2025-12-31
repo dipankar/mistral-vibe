@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import argparse
 import sys
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Generator
 
 from rich import print as rprint
 
@@ -15,7 +18,11 @@ from vibe.core.config import (
 from vibe.core.config_path import CONFIG_FILE, HISTORY_FILE, INSTRUCTIONS_FILE
 from vibe.core.interaction_logger import InteractionLogger
 from vibe.core.programmatic import run_programmatic
-from vibe.core.session_lock import is_session_active, acquire_session_lock, release_session_lock
+from vibe.core.session_lock import (
+    acquire_session_lock,
+    is_session_active,
+    release_session_lock,
+)
 from vibe.core.types import OutputFormat, ResumeSessionInfo
 from vibe.core.utils import ConversationLimitException
 from vibe.setup.onboarding import run_onboarding
@@ -129,174 +136,206 @@ def load_config_or_exit(agent: str | None = None) -> VibeConfig:
         sys.exit(1)
 
 
-def main() -> None:  # noqa: PLR0912, PLR0915
+def ensure_default_files() -> None:
+    create_file_if_missing(CONFIG_FILE.path, create_default=True)
+    create_file_if_missing(INSTRUCTIONS_FILE.path)
+    create_file_if_missing(HISTORY_FILE.path, default_content="Hello Vibe!\n")
+
+
+def create_file_if_missing(
+    path: Path, *, create_default: bool = False, default_content: str | None = None
+) -> None:
+    if path.exists():
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if create_default:
+            VibeConfig.save_updates(VibeConfig.create_default())
+        elif default_content is not None:
+            path.write_text(default_content, encoding="utf-8")
+        else:
+            path.touch()
+    except Exception as exc:  # pragma: no cover - filesystem edge cases
+        rprint(f"[yellow]Could not create {path.name}: {exc}[/]")
+
+
+@contextmanager
+def session_lock() -> Generator[None, None, None]:
+    if not acquire_session_lock():
+        rprint("[red]Failed to acquire session lock[/]")
+        sys.exit(1)
+    try:
+        yield
+    finally:
+        release_session_lock()
+
+
+def maybe_resume_session(
+    args: argparse.Namespace, config: VibeConfig
+) -> tuple[list | None, ResumeSessionInfo | None]:
+    if args.prompt is not None:
+        return None, None
+    if args.continue_session or args.resume:
+        return load_requested_session(args, config)
+    if not config.session_logging.enabled:
+        return None, None
+    latest_session = InteractionLogger.find_latest_session(config.session_logging)
+    if not latest_session:
+        return None, None
+    try:
+        _, metadata = InteractionLogger.load_session(latest_session)
+        session_id = metadata.get("session_id", "unknown")[:8]
+        session_time = metadata.get("start_time", "unknown time")
+        rprint(f"\n[cyan]Previous session found:[/] {session_id} from {session_time}")
+        response = input("Resume previous session? [y/N]: ").strip().lower()
+        if response in ("y", "yes"):
+            args.continue_session = True
+            rprint("[green]Resuming session...[/]\n")
+            return load_requested_session(args, config)
+        rprint("[dim]Starting fresh session...[/]\n")
+    except Exception:
+        pass
+    return None, None
+
+
+def load_requested_session(
+    args: argparse.Namespace, config: VibeConfig
+) -> tuple[list | None, ResumeSessionInfo | None]:
+    if not config.session_logging.enabled:
+        rprint(
+            "[red]Session logging is disabled. "
+            "Enable it in config to use --continue or --resume[/]"
+        )
+        sys.exit(1)
+
+    session_to_load = None
+    if args.continue_session:
+        session_to_load = InteractionLogger.find_latest_session(
+            config.session_logging
+        )
+        if not session_to_load:
+            rprint(
+                f"[red]No previous sessions found in "
+                f"{config.session_logging.save_dir}[/]"
+            )
+            sys.exit(1)
+    else:
+        session_to_load = InteractionLogger.find_session_by_id(
+            args.resume, config.session_logging
+        )
+        if not session_to_load:
+            rprint(
+                f"[red]Session '{args.resume}' not found in "
+                f"{config.session_logging.save_dir}[/]"
+            )
+            sys.exit(1)
+
+    loaded_messages, metadata = InteractionLogger.load_session(session_to_load)
+    session_id = metadata.get("session_id", "unknown")[:8]
+    session_time = metadata.get("start_time", "unknown time")
+    session_info = ResumeSessionInfo(
+        type="continue" if args.continue_session else "resume",
+        session_id=session_id,
+        session_time=session_time,
+    )
+    return loaded_messages, session_info
+
+
+def run_programmatic_session(
+    *,
+    config: VibeConfig,
+    args: argparse.Namespace,
+    prompt: str,
+    loaded_messages: list | None,
+) -> None:
+    output_format = OutputFormat(args.output if hasattr(args, "output") else "text")
+    try:
+        final_response = run_programmatic(
+            config=config,
+            prompt=prompt,
+            max_turns=args.max_turns,
+            max_price=args.max_price,
+            output_format=output_format,
+            previous_messages=loaded_messages,
+        )
+        if final_response:
+            print(final_response)
+        sys.exit(0)
+    except ConversationLimitException as exc:
+        print(exc, file=sys.stderr)
+        sys.exit(1)
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+def run_interactive_session(
+    *,
+    config: VibeConfig,
+    args: argparse.Namespace,
+    stdin_prompt: str | None,
+    loaded_messages: list | None,
+    session_info: ResumeSessionInfo | None,
+) -> None:
+    run_textual_ui(
+        config,
+        auto_approve=args.auto_approve,
+        enable_streaming=True,
+        initial_prompt=args.initial_prompt or stdin_prompt,
+        loaded_messages=loaded_messages,
+        session_info=session_info,
+    )
+
+
+def main() -> None:  # noqa: PLR0912
     load_api_keys_from_env()
     args = parse_arguments()
 
     if args.setup:
         run_onboarding()
         sys.exit(0)
-    try:
-        if not CONFIG_FILE.path.exists():
-            try:
-                VibeConfig.save_updates(VibeConfig.create_default())
-            except Exception as e:
-                rprint(f"[yellow]Could not create default config file: {e}[/]")
 
-        if not INSTRUCTIONS_FILE.path.exists():
-            try:
-                INSTRUCTIONS_FILE.path.parent.mkdir(parents=True, exist_ok=True)
-                INSTRUCTIONS_FILE.path.touch()
-            except Exception as e:
-                rprint(f"[yellow]Could not create instructions file: {e}[/]")
+    ensure_default_files()
+    config = load_config_or_exit(args.agent)
+    if args.enabled_tools:
+        config.enabled_tools = args.enabled_tools
 
-        if not HISTORY_FILE.path.exists():
-            try:
-                HISTORY_FILE.path.parent.mkdir(parents=True, exist_ok=True)
-                HISTORY_FILE.path.write_text("Hello Vibe!\n", "utf-8")
-            except Exception as e:
-                rprint(f"[yellow]Could not create history file: {e}[/]")
+    active, active_pid, active_time = is_session_active()
+    if active:
+        rprint(
+            f"[red]Another vibe session is already running[/] "
+            f"(PID: {active_pid}, started: {active_time})"
+        )
+        rprint("[dim]Only one interactive session can run at a time.[/]")
+        sys.exit(1)
 
-        config = load_config_or_exit(args.agent)
+    loaded_messages, session_info = maybe_resume_session(args, config)
+    stdin_prompt = get_prompt_from_stdin()
 
-        if args.enabled_tools:
-            config.enabled_tools = args.enabled_tools
-
-        loaded_messages = None
-        session_info = None
-
-        # Check if another session is already running
-        active, active_pid, active_time = is_session_active()
-        if active:
-            rprint(
-                f"[red]Another vibe session is already running[/] "
-                f"(PID: {active_pid}, started: {active_time})"
-            )
-            rprint("[dim]Only one interactive session can run at a time.[/]")
+    if args.prompt is not None:
+        prompt = args.prompt or stdin_prompt
+        if not prompt:
+            print("Error: No prompt provided for programmatic mode", file=sys.stderr)
             sys.exit(1)
+        run_programmatic_session(
+            config=config,
+            args=args,
+            prompt=prompt,
+            loaded_messages=loaded_messages,
+        )
 
-        # Acquire session lock for interactive mode
-        if args.prompt is None:
-            if not acquire_session_lock():
-                rprint("[red]Failed to acquire session lock[/]")
-                sys.exit(1)
-
-        # Check if user wants to resume a previous session (interactive mode only)
-        if (
-            not args.continue_session
-            and not args.resume
-            and args.prompt is None
-            and config.session_logging.enabled
-        ):
-            latest_session = InteractionLogger.find_latest_session(
-                config.session_logging
-            )
-            if latest_session:
-                try:
-                    _, metadata = InteractionLogger.load_session(latest_session)
-                    session_id = metadata.get("session_id", "unknown")[:8]
-                    session_time = metadata.get("start_time", "unknown time")
-
-                    rprint(f"\n[cyan]Previous session found:[/] {session_id} from {session_time}")
-                    response = input("Resume previous session? [y/N]: ").strip().lower()
-
-                    if response in ("y", "yes"):
-                        args.continue_session = True
-                        rprint("[green]Resuming session...[/]\n")
-                    else:
-                        rprint("[dim]Starting fresh session...[/]\n")
-                except Exception:
-                    pass  # Silently ignore errors checking for previous sessions
-
-        if args.continue_session or args.resume:
-            if not config.session_logging.enabled:
-                rprint(
-                    "[red]Session logging is disabled. "
-                    "Enable it in config to use --continue or --resume[/]"
-                )
-                sys.exit(1)
-
-            session_to_load = None
-            if args.continue_session:
-                session_to_load = InteractionLogger.find_latest_session(
-                    config.session_logging
-                )
-                if not session_to_load:
-                    rprint(
-                        f"[red]No previous sessions found in "
-                        f"{config.session_logging.save_dir}[/]"
-                    )
-                    sys.exit(1)
-            else:
-                session_to_load = InteractionLogger.find_session_by_id(
-                    args.resume, config.session_logging
-                )
-                if not session_to_load:
-                    rprint(
-                        f"[red]Session '{args.resume}' not found in "
-                        f"{config.session_logging.save_dir}[/]"
-                    )
-                    sys.exit(1)
-
-            try:
-                loaded_messages, metadata = InteractionLogger.load_session(
-                    session_to_load
-                )
-                session_id = metadata.get("session_id", "unknown")[:8]
-                session_time = metadata.get("start_time", "unknown time")
-
-                session_info = ResumeSessionInfo(
-                    type="continue" if args.continue_session else "resume",
-                    session_id=session_id,
-                    session_time=session_time,
-                )
-            except Exception as e:
-                rprint(f"[red]Failed to load session: {e}[/]")
-                sys.exit(1)
-
-        stdin_prompt = get_prompt_from_stdin()
-        if args.prompt is not None:
-            programmatic_prompt = args.prompt or stdin_prompt
-            if not programmatic_prompt:
-                print(
-                    "Error: No prompt provided for programmatic mode", file=sys.stderr
-                )
-                sys.exit(1)
-            output_format = OutputFormat(
-                args.output if hasattr(args, "output") else "text"
-            )
-
-            try:
-                final_response = run_programmatic(
-                    config=config,
-                    prompt=programmatic_prompt,
-                    max_turns=args.max_turns,
-                    max_price=args.max_price,
-                    output_format=output_format,
-                    previous_messages=loaded_messages,
-                )
-                if final_response:
-                    print(final_response)
-                sys.exit(0)
-            except ConversationLimitException as e:
-                print(e, file=sys.stderr)
-                sys.exit(1)
-            except RuntimeError as e:
-                print(f"Error: {e}", file=sys.stderr)
-                sys.exit(1)
-        else:
-            run_textual_ui(
-                config,
-                auto_approve=args.auto_approve,
-                enable_streaming=True,
-                initial_prompt=args.initial_prompt or stdin_prompt,
+    with session_lock():
+        try:
+            run_interactive_session(
+                config=config,
+                args=args,
+                stdin_prompt=stdin_prompt,
                 loaded_messages=loaded_messages,
                 session_info=session_info,
             )
-
-    except (KeyboardInterrupt, EOFError):
-        rprint("\n[dim]Bye![/]")
-        sys.exit(0)
+        except (KeyboardInterrupt, EOFError):
+            rprint("\n[dim]Bye![/]")
+            sys.exit(0)
 
 
 if __name__ == "__main__":

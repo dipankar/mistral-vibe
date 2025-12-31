@@ -49,12 +49,12 @@ This document provides a technical overview of Mistral Vibe's internal architect
 
 ### Agent (`vibe/core/agent.py`)
 
-The main orchestrator that handles:
-- Conversation loop with LLM
-- Tool execution pipeline
-- Message history management
-- Event emission for UI updates
-- Middleware chain (auto-compact, context warnings, etc.)
+The main orchestrator stitches together smaller collaborators:
+- **ConversationState** – encapsulates history/memory management and message observers.
+- **MiddlewareRunner** – enforces guards (max turns, max price) and emits compaction triggers.
+- **ToolInvocationManager** – owns approval prompts, allow/deny checks, and event fan-out for every tool execution.
+- Conversation loop with the active LLM backend and streaming handler.
+- Event emission for UI updates.
 
 ```python
 class Agent:
@@ -194,6 +194,7 @@ All components emit events for UI updates and logging:
 
 ```python
 class BaseEvent(BaseModel, ABC):
+    event_id: str = Field(default_factory=lambda: uuid4().hex)
     subagent_id: str | None = None      # Set when from subagent
     subagent_step_id: str | None = None
 
@@ -213,6 +214,8 @@ class MemoryEntryEvent(BaseEvent): ...
 class CompactStartEvent(BaseEvent): ...
 class CompactEndEvent(BaseEvent): ...
 ```
+
+Each event carries a UUID-backed `event_id`, allowing the Textual UI to deliver local events immediately while still ignoring the matching payloads when they loop back over the IPC bus.
 
 ## Configuration System
 
@@ -311,6 +314,19 @@ vibe/cli/textual_ui/widgets/
 ├── todo_panel.py        # Todo list display
 └── status_icons.py      # Shared status icons
 ```
+
+### Planner-Oriented UI Flow
+
+- **State Store (`vibe/cli/textual_ui/state_store.py`)** – `UIStateStore` is the single source of truth for planner and bottom-panel state. Controllers update the store, while view-specific presenters subscribe to keys (bottom panel mode, collapsible sections, confirmation prompts) and reactively update widgets, eliminating scattered boolean flags.
+- **Chat Input Presenter (`vibe/cli/textual_ui/presenters/chat_input_presenter.py`)** – Listens for planner confirmation changes and toggles the prompt banner inside `ChatInputContainer` so VibeApp no longer handles those transitions directly.
+- **Bottom Panel Manager (`vibe/cli/textual_ui/bottom_panel_manager.py`)** – Owns the bottom panel widget stack (chat input, config UI, approval UI) and reacts to `UIStateStore` changes, so VibeApp asks it to “show config” or “return to input” instead of manually mounting/removing widgets.
+- **App Controller (`vibe/cli/textual_ui/app_controller.py`)** – Mediates user messages, planner confirmations, and agent initialization. VibeApp forwards chat submissions to the controller, which decides whether to auto-plan, prompt, or run the agent.
+- **Command Controller (`vibe/cli/textual_ui/command_controller.py`)** – Encapsulates the full slash-command surface (help, planner lifecycle/decisions, status/config/log/memory/compact, retries, exit) so the Textual app forwards intent handling to a single place rather than mixing orchestration into widget code.
+- **Planner Controller (`vibe/cli/textual_ui/planner_controller.py`)** – Owns the `PlannerAgent`, handles plan persistence, orchestrates subagent execution, and feeds UI callbacks. The app never instantiates `PlannerAgent` directly; all plan lifecycle changes flow through the controller so they are centrally observable.
+- **IPC Event Bus (`vibe/ipc/event_bus.py`)** – A required pynng-backed pub/sub bus deduplicates event fan-out. Every `EventDispatcher` publishes events to the bus, and the Textual UI subscribes to the same address, even when API-driven agents run out-of-process. The UI also streams events directly from the dispatcher and tags each payload with `event_id` so it can ignore the duplicate bus echo. If pynng cannot be initialized the CLI refuses to start, ensuring all surfaces observe the same IPC contract.
+- **Headless Surfaces** – Programmatic runs (`vibe/core/programmatic.py`) and ACP sessions (`vibe/acp/acp_agent.py`) also publish every `BaseEvent` onto the same bus, so external dashboards or alternate UIs can subscribe without embedding Textual.
+
+This separation keeps planning UX extensible: new features target the store/controller/bus seams without reaching into widget internals.
 
 ### Command Registry (`vibe/cli/commands.py`)
 

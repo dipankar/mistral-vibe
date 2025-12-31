@@ -15,6 +15,9 @@ from vibe.cli.textual_ui.widgets.chat_input.completion_manager import (
     MultiCompletionManager,
 )
 from vibe.cli.textual_ui.widgets.chat_input.completion_popup import CompletionPopup
+from vibe.cli.textual_ui.widgets.chat_input.plan_confirmation import (
+    PlanConfirmationPrompt,
+)
 from vibe.cli.textual_ui.widgets.chat_input.text_area import ChatTextArea
 from vibe.core.autocompletion.completers import CommandCompleter, PathCompleter
 
@@ -31,6 +34,12 @@ class ChatInputContainer(Vertical):
 
     class ThinkingModeToggleRequested(Message):
         """Bubble thinking mode toggle requests up to the app."""
+
+    class PlanConfirmationAccepted(Message):
+        """User approved planner usage from the confirmation banner."""
+
+    class PlanConfirmationDeclined(Message):
+        """User rejected planner usage from the confirmation banner."""
 
     def __init__(
         self,
@@ -56,6 +65,7 @@ class ChatInputContainer(Vertical):
         ])
         self._completion_popup: CompletionPopup | None = None
         self._body: ChatInputBody | None = None
+        self._plan_prompt: PlanConfirmationPrompt | None = None
 
     def compose(self) -> ComposeResult:
         self._completion_popup = CompletionPopup()
@@ -64,6 +74,9 @@ class ChatInputContainer(Vertical):
         with Vertical(
             id=self.ID_INPUT_BOX, classes="border-warning" if self._show_warning else ""
         ):
+            self._plan_prompt = PlanConfirmationPrompt()
+            yield self._plan_prompt
+
             self._body = ChatInputBody(history_file=self._history_file, id="input-body")
 
             yield self._body
@@ -171,3 +184,21 @@ class ChatInputContainer(Vertical):
             input_box.add_class(self.THINKING_MODE_CLASS)
         else:
             input_box.remove_class(self.THINKING_MODE_CLASS)
+
+    def show_plan_confirmation(self, goal: str) -> None:
+        if self._plan_prompt:
+            self._plan_prompt.show_prompt(goal)
+
+    def hide_plan_confirmation(self) -> None:
+        if self._plan_prompt:
+            self._plan_prompt.hide_prompt()
+
+    def on_plan_confirmation_prompt_accepted(
+        self, _: PlanConfirmationPrompt.Accepted
+    ) -> None:
+        self.post_message(self.PlanConfirmationAccepted())
+
+    def on_plan_confirmation_prompt_declined(
+        self, _: PlanConfirmationPrompt.Declined
+    ) -> None:
+        self.post_message(self.PlanConfirmationDeclined())

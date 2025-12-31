@@ -3,12 +3,9 @@ from __future__ import annotations
 import asyncio
 from collections import OrderedDict
 from collections.abc import AsyncGenerator, Callable
-from enum import StrEnum, auto
 import time
-from typing import Any, cast
+from typing import Any
 from uuid import uuid4
-
-from pydantic import BaseModel
 
 from vibe.core.config import VibeConfig
 from vibe.core.interaction_logger import InteractionLogger
@@ -16,32 +13,20 @@ from vibe.core.llm.backend.factory import BACKEND_FACTORY
 from vibe.core.llm.format import APIToolFormatHandler, ResolvedMessage
 from vibe.core.llm.types import BackendLike
 from vibe.core.memory import MemoryEntry, SessionMemory
+from vibe.core.conversation_state import ConversationState
 from vibe.core.middleware import (
-    AutoCompactMiddleware,
-    ContextWarningMiddleware,
     ConversationContext,
     MiddlewareAction,
-    MiddlewarePipeline,
     MiddlewareResult,
-    PriceLimitMiddleware,
     ResetReason,
-    TurnLimitMiddleware,
 )
 from vibe.core.prompts import UtilityPrompt
 from vibe.core.system_prompt import get_universal_system_prompt
-from vibe.core.tools.base import (
-    BaseTool,
-    ToolError,
-    ToolPermission,
-    ToolPermissionError,
-)
 from vibe.core.tools.manager import ToolManager
 from vibe.core.types import (
     AgentStats,
     ApprovalCallback,
-    ApprovalResponse,
     AssistantEvent,
-    AsyncApprovalCallback,
     BaseEvent,
     CompactEndEvent,
     CompactStartEvent,
@@ -49,29 +34,17 @@ from vibe.core.types import (
     LLMMessage,
     MemoryEntryEvent,
     Role,
-    SyncApprovalCallback,
     ToolCall,
     ToolCallEvent,
     ToolResultEvent,
 )
 from vibe.core.utils import (
-    TOOL_ERROR_TAG,
     VIBE_STOP_EVENT_TAG,
-    CancellationReason,
     get_user_agent,
-    get_user_cancellation_message,
     is_user_cancellation_event,
 )
-
-
-class ToolExecutionResponse(StrEnum):
-    SKIP = auto()
-    EXECUTE = auto()
-
-
-class ToolDecision(BaseModel):
-    verdict: ToolExecutionResponse
-    feedback: str | None = None
+from vibe.core.middleware_runner import MiddlewareRunner
+from vibe.core.tool_invocation_manager import ToolInvocationManager
 
 
 class AgentError(Exception):
@@ -105,21 +78,17 @@ class Agent:
         self.backend_factory = lambda: backend or self._select_backend()
         self.backend = self.backend_factory()
 
-        self.message_observer = message_observer
-        self._last_observed_message_index: int = 0
-        self.middleware_pipeline = MiddlewarePipeline()
+        self._middleware = MiddlewareRunner(config)
         self.enable_streaming = enable_streaming
         self._setup_middleware(max_turns, max_price)
 
         system_prompt = get_universal_system_prompt(self.tool_manager, config)
 
-        self.messages = [LLMMessage(role=Role.system, content=system_prompt)]
-        self.session_memory = SessionMemory()
-        self._memory_synced = False
-
-        if self.message_observer:
-            self.message_observer(self.messages[0])
-            self._last_observed_message_index = 1
+        self._conversation = ConversationState(
+            system_prompt,
+            session_memory=SessionMemory(),
+            message_observer=message_observer,
+        )
 
         self.stats = AgentStats()
         try:
@@ -142,6 +111,27 @@ class Agent:
         )
 
         self._last_chunk: LLMChunk | None = None
+        self._tool_invocation_manager = ToolInvocationManager(
+            tool_manager_getter=lambda: self.tool_manager,
+            format_handler=self.format_handler,
+            stats_getter=lambda: self.stats,
+            append_message=self.add_message,
+            auto_approve_getter=lambda: self.auto_approve,
+            approval_callback_getter=lambda: self.approval_callback,
+            persist_interaction=self._persist_interaction,
+        )
+
+    @property
+    def messages(self) -> list[LLMMessage]:
+        return self._conversation.messages
+
+    @messages.setter
+    def messages(self, value: list[LLMMessage]) -> None:
+        self._conversation.messages = value
+
+    @property
+    def session_memory(self) -> SessionMemory:
+        return self._conversation.session_memory
 
     def _select_backend(self) -> BackendLike:
         active_model = self.config.get_active_model()
@@ -150,24 +140,13 @@ class Agent:
         return BACKEND_FACTORY[provider.backend](provider=provider, timeout=timeout)
 
     def add_message(self, message: LLMMessage) -> None:
-        self.messages.append(message)
+        self._conversation.add_message(message)
 
     def _ensure_memory_initialized(self) -> None:
-        if self._memory_synced:
-            return
-        self.session_memory.sync_from_messages(self.messages)
-        self._memory_synced = True
+        self._conversation.ensure_memory_initialized()
 
     def _flush_new_messages(self) -> None:
-        if not self.message_observer:
-            return
-
-        if self._last_observed_message_index >= len(self.messages):
-            return
-
-        for msg in self.messages[self._last_observed_message_index :]:
-            self.message_observer(msg)
-        self._last_observed_message_index = len(self.messages)
+        self._conversation.flush_new_messages()
 
     async def act(self, msg: str) -> AsyncGenerator[BaseEvent]:
         self._ensure_memory_initialized()
@@ -176,28 +155,7 @@ class Agent:
             yield event
 
     def _setup_middleware(self, max_turns: int | None, max_price: float | None) -> None:
-        self.middleware_pipeline.clear()
-
-        if max_turns is not None:
-            self.middleware_pipeline.add(TurnLimitMiddleware(max_turns))
-
-        if max_price is not None:
-            self.middleware_pipeline.add(PriceLimitMiddleware(max_price))
-
-        if self.config.auto_compact_threshold > 0:
-            self.middleware_pipeline.add(
-                AutoCompactMiddleware(
-                    self.config.auto_compact_threshold,
-                    self.config.memory_soft_limit_ratio,
-                )
-            )
-            if self.config.context_warnings:
-                self.middleware_pipeline.add(
-                    ContextWarningMiddleware(
-                        self.config.memory_soft_limit_ratio,
-                        self.config.auto_compact_threshold,
-                    )
-                )
+        self._middleware.configure(max_turns=max_turns, max_price=max_price)
 
     async def _handle_middleware_result(
         self, result: MiddlewareResult
@@ -302,7 +260,7 @@ class Agent:
         try:
             should_break_loop = False
             while not should_break_loop:
-                result = await self.middleware_pipeline.run_before_turn(
+                result = await self._middleware.run_before_turn(
                     self._get_context()
                 )
 
@@ -339,7 +297,7 @@ class Agent:
                     )
                     return
 
-                after_result = await self.middleware_pipeline.run_after_turn(
+                after_result = await self._middleware.run_after_turn(
                     self._get_context()
                 )
 
@@ -391,7 +349,7 @@ class Agent:
         if not resolved.tool_calls and not resolved.failed_calls:
             return
 
-        async for event in self._handle_tool_calls(resolved):
+        async for event in self._tool_invocation_manager.handle(resolved):
             yield event
 
     def _create_assistant_event(
@@ -473,181 +431,6 @@ class Agent:
         self.messages.append(assistant_msg)
 
         return AssistantEvent(content=assistant_msg.content or "")
-
-    async def _handle_tool_calls(  # noqa: PLR0915
-        self, resolved: ResolvedMessage
-    ) -> AsyncGenerator[ToolCallEvent | ToolResultEvent]:
-        for failed in resolved.failed_calls:
-            error_msg = f"<{TOOL_ERROR_TAG}>{failed.tool_name}: {failed.error}</{TOOL_ERROR_TAG}>"
-
-            yield ToolResultEvent(
-                tool_name=failed.tool_name,
-                tool_class=None,
-                error=error_msg,
-                tool_call_id=failed.call_id,
-            )
-
-            self.stats.tool_calls_failed += 1
-            self.messages.append(
-                self.format_handler.create_failed_tool_response_message(
-                    failed, error_msg
-                )
-            )
-
-        for tool_call in resolved.tool_calls:
-            tool_call_id = tool_call.call_id
-
-            yield ToolCallEvent(
-                tool_name=tool_call.tool_name,
-                tool_class=tool_call.tool_class,
-                args=tool_call.validated_args,
-                tool_call_id=tool_call_id,
-            )
-
-            try:
-                tool_instance = self.tool_manager.get(tool_call.tool_name)
-            except Exception as exc:
-                error_msg = f"Error getting tool '{tool_call.tool_name}': {exc}"
-                yield ToolResultEvent(
-                    tool_name=tool_call.tool_name,
-                    tool_class=tool_call.tool_class,
-                    error=error_msg,
-                    tool_call_id=tool_call_id,
-                )
-                self.messages.append(
-                    LLMMessage.model_validate(
-                        self.format_handler.create_tool_response_message(
-                            tool_call, error_msg
-                        )
-                    )
-                )
-                continue
-
-            decision = await self._should_execute_tool(
-                tool_instance, tool_call.args_dict, tool_call_id
-            )
-
-            if decision.verdict == ToolExecutionResponse.SKIP:
-                self.stats.tool_calls_rejected += 1
-                skip_reason = decision.feedback or str(
-                    get_user_cancellation_message(
-                        CancellationReason.TOOL_SKIPPED, tool_call.tool_name
-                    )
-                )
-
-                yield ToolResultEvent(
-                    tool_name=tool_call.tool_name,
-                    tool_class=tool_call.tool_class,
-                    skipped=True,
-                    skip_reason=skip_reason,
-                    tool_call_id=tool_call_id,
-                )
-
-                self.messages.append(
-                    LLMMessage.model_validate(
-                        self.format_handler.create_tool_response_message(
-                            tool_call, skip_reason
-                        )
-                    )
-                )
-                continue
-
-            self.stats.tool_calls_agreed += 1
-
-            try:
-                start_time = time.perf_counter()
-                result_model = await tool_instance.invoke(**tool_call.args_dict)
-                duration = time.perf_counter() - start_time
-
-                text = "\n".join(
-                    f"{k}: {v}" for k, v in result_model.model_dump().items()
-                )
-
-                self.messages.append(
-                    LLMMessage.model_validate(
-                        self.format_handler.create_tool_response_message(
-                            tool_call, text
-                        )
-                    )
-                )
-
-                yield ToolResultEvent(
-                    tool_name=tool_call.tool_name,
-                    tool_class=tool_call.tool_class,
-                    result=result_model,
-                    duration=duration,
-                    tool_call_id=tool_call_id,
-                )
-
-                self.stats.tool_calls_succeeded += 1
-
-            except asyncio.CancelledError:
-                cancel = str(
-                    get_user_cancellation_message(CancellationReason.TOOL_INTERRUPTED)
-                )
-                yield ToolResultEvent(
-                    tool_name=tool_call.tool_name,
-                    tool_class=tool_call.tool_class,
-                    error=cancel,
-                    tool_call_id=tool_call_id,
-                )
-                self.messages.append(
-                    LLMMessage.model_validate(
-                        self.format_handler.create_tool_response_message(
-                            tool_call, cancel
-                        )
-                    )
-                )
-                await self.interaction_logger.save_interaction(
-                    self.messages, self.stats, self.config, self.tool_manager
-                )
-                raise
-
-            except KeyboardInterrupt:
-                cancel = str(
-                    get_user_cancellation_message(CancellationReason.TOOL_INTERRUPTED)
-                )
-                yield ToolResultEvent(
-                    tool_name=tool_call.tool_name,
-                    tool_class=tool_call.tool_class,
-                    error=cancel,
-                    tool_call_id=tool_call_id,
-                )
-                self.messages.append(
-                    LLMMessage.model_validate(
-                        self.format_handler.create_tool_response_message(
-                            tool_call, cancel
-                        )
-                    )
-                )
-                await self.interaction_logger.save_interaction(
-                    self.messages, self.stats, self.config, self.tool_manager
-                )
-                raise
-
-            except (ToolError, ToolPermissionError) as exc:
-                error_msg = f"<{TOOL_ERROR_TAG}>{tool_instance.get_name()} failed: {exc}</{TOOL_ERROR_TAG}>"
-
-                yield ToolResultEvent(
-                    tool_name=tool_call.tool_name,
-                    tool_class=tool_call.tool_class,
-                    error=error_msg,
-                    tool_call_id=tool_call_id,
-                )
-
-                if isinstance(exc, ToolPermissionError):
-                    self.stats.tool_calls_agreed -= 1
-                    self.stats.tool_calls_rejected += 1
-                else:
-                    self.stats.tool_calls_failed += 1
-                self.messages.append(
-                    LLMMessage.model_validate(
-                        self.format_handler.create_tool_response_message(
-                            tool_call, error_msg
-                        )
-                    )
-                )
-                continue
 
     async def _chat(self, max_tokens: int | None = None) -> LLMChunk:
         active_model = self.config.get_active_model()
@@ -763,94 +546,19 @@ class Agent:
                 f"API error from {provider.name} (model: {active_model.name}): {e}"
             ) from e
 
-    async def _should_execute_tool(
-        self, tool: BaseTool, args: dict[str, Any], tool_call_id: str
-    ) -> ToolDecision:
-        if self.auto_approve:
-            return ToolDecision(verdict=ToolExecutionResponse.EXECUTE)
-
-        args_model, _ = tool._get_tool_args_results()
-        validated_args = args_model.model_validate(args)
-
-        allowlist_denylist_result = tool.check_allowlist_denylist(validated_args)
-        if allowlist_denylist_result == ToolPermission.ALWAYS:
-            return ToolDecision(verdict=ToolExecutionResponse.EXECUTE)
-        elif allowlist_denylist_result == ToolPermission.NEVER:
-            denylist_patterns = tool.config.denylist
-            denylist_str = ", ".join(repr(pattern) for pattern in denylist_patterns)
-            return ToolDecision(
-                verdict=ToolExecutionResponse.SKIP,
-                feedback=f"Tool '{tool.get_name()}' blocked by denylist: [{denylist_str}]",
-            )
-
-        tool_name = tool.get_name()
-        perm = self.tool_manager.get_tool_config(tool_name).permission
-
-        if perm is ToolPermission.ALWAYS:
-            return ToolDecision(verdict=ToolExecutionResponse.EXECUTE)
-        if perm is ToolPermission.NEVER:
-            return ToolDecision(
-                verdict=ToolExecutionResponse.SKIP,
-                feedback=f"Tool '{tool_name}' is permanently disabled",
-            )
-
-        return await self._ask_approval(tool_name, args, tool_call_id)
-
-    async def _ask_approval(
-        self, tool_name: str, args: dict[str, Any], tool_call_id: str
-    ) -> ToolDecision:
-        if not self.approval_callback:
-            return ToolDecision(
-                verdict=ToolExecutionResponse.SKIP,
-                feedback="Tool execution not permitted.",
-            )
-        if asyncio.iscoroutinefunction(self.approval_callback):
-            async_callback = cast(AsyncApprovalCallback, self.approval_callback)
-            response, feedback = await async_callback(tool_name, args, tool_call_id)
-        else:
-            sync_callback = cast(SyncApprovalCallback, self.approval_callback)
-            response, feedback = sync_callback(tool_name, args, tool_call_id)
-
-        match response:
-            case ApprovalResponse.YES:
-                return ToolDecision(
-                    verdict=ToolExecutionResponse.EXECUTE, feedback=feedback
-                )
-            case ApprovalResponse.NO:
-                return ToolDecision(
-                    verdict=ToolExecutionResponse.SKIP, feedback=feedback
-                )
-
     def _clean_message_history(self) -> None:
-        ACCEPTABLE_HISTORY_SIZE = 2
-        if len(self.messages) < ACCEPTABLE_HISTORY_SIZE:
-            return
-        self._fill_missing_tool_responses()
-        self._ensure_assistant_after_tools()
+        self._conversation.clean_history()
 
     def _conversation_without_memory(self) -> list[LLMMessage]:
-        return [
-            msg
-            for msg in self.messages[1:]
-            if not SessionMemory.is_memory_message(msg)
-        ]
+        return self._conversation.conversation_without_memory()
 
     def _split_history_for_memory(
         self, *, force_full: bool = False
     ) -> tuple[list[LLMMessage], list[LLMMessage]]:
-        conversation = self._conversation_without_memory()
-        min_recent = 0 if force_full else 4
-        if len(conversation) <= min_recent:
-            return [], conversation
-
-        cutoff = len(conversation) - min_recent
-        return conversation[:cutoff], conversation[cutoff:]
+        return self._conversation.split_history_for_memory(force_full=force_full)
 
     def _has_compressible_history(self, *, force_full: bool = False) -> bool:
-        memory_candidates, _ = self._split_history_for_memory(
-            force_full=force_full
-        )
-        return bool(memory_candidates)
+        return self._conversation.has_compressible_history(force_full=force_full)
 
     async def _compress_history_into_memory(
         self, force_full: bool = False, token_snapshot: int | None = None
@@ -897,7 +605,7 @@ class Agent:
             await self.interaction_logger.save_interaction(
                 self.messages, self.stats, self.config, self.tool_manager
             )
-            self.middleware_pipeline.reset(reset_reason=ResetReason.COMPACT)
+            self._middleware.reset(reason=ResetReason.COMPACT)
             return summary, entry
 
         except Exception:
@@ -926,13 +634,7 @@ class Agent:
             self.messages = preserved_messages
 
     def _rebuild_messages_with_memory(self, recent_messages: list[LLMMessage]) -> None:
-        system_message = self.messages[0]
-        filtered_recent = [
-            msg for msg in recent_messages if not SessionMemory.is_memory_message(msg)
-        ]
-        rebuilt = [system_message, *self.session_memory.as_messages(), *filtered_recent]
-        self.messages = rebuilt
-        self._memory_synced = True
+        self._conversation.rebuild_messages_with_memory(recent_messages)
 
     async def _refresh_context_tokens(self) -> None:
         active_model = self.config.get_active_model()
@@ -948,58 +650,6 @@ class Agent:
             )
         self.stats.context_tokens = actual_context_tokens
 
-    def _fill_missing_tool_responses(self) -> None:
-        i = 1
-        while i < len(self.messages):  # noqa: PLR1702
-            msg = self.messages[i]
-
-            if msg.role == "assistant" and msg.tool_calls:
-                expected_responses = len(msg.tool_calls)
-
-                if expected_responses > 0:
-                    actual_responses = 0
-                    j = i + 1
-                    while j < len(self.messages) and self.messages[j].role == "tool":
-                        actual_responses += 1
-                        j += 1
-
-                    if actual_responses < expected_responses:
-                        insertion_point = i + 1 + actual_responses
-
-                        for call_idx in range(actual_responses, expected_responses):
-                            tool_call_data = msg.tool_calls[call_idx]
-
-                            empty_response = LLMMessage(
-                                role=Role.tool,
-                                tool_call_id=tool_call_data.id or "",
-                                name=(tool_call_data.function.name or "")
-                                if tool_call_data.function
-                                else "",
-                                content=str(
-                                    get_user_cancellation_message(
-                                        CancellationReason.TOOL_NO_RESPONSE
-                                    )
-                                ),
-                            )
-
-                            self.messages.insert(insertion_point, empty_response)
-                            insertion_point += 1
-
-                    i = i + 1 + expected_responses
-                    continue
-
-            i += 1
-
-    def _ensure_assistant_after_tools(self) -> None:
-        MIN_MESSAGE_SIZE = 2
-        if len(self.messages) < MIN_MESSAGE_SIZE:
-            return
-
-        last_msg = self.messages[-1]
-        if last_msg.role is Role.tool:
-            empty_assistant_msg = LLMMessage(role=Role.assistant, content="Understood.")
-            self.messages.append(empty_assistant_msg)
-
     def _reset_session(self) -> None:
         self.session_id = str(uuid4())
         self.interaction_logger.reset_session(self.session_id)
@@ -1007,13 +657,18 @@ class Agent:
     def set_approval_callback(self, callback: ApprovalCallback) -> None:
         self.approval_callback = callback
 
+    async def _persist_interaction(self) -> None:
+        await self.interaction_logger.save_interaction(
+            self.messages, self.stats, self.config, self.tool_manager
+        )
+
     async def clear_history(self) -> None:
         await self.interaction_logger.save_interaction(
             self.messages, self.stats, self.config, self.tool_manager
         )
         self.messages = self.messages[:1]
         self.session_memory.clear()
-        self._memory_synced = False
+        self._conversation.mark_memory_synced(False)
 
         self.stats = AgentStats()
 
@@ -1025,7 +680,7 @@ class Agent:
         except ValueError:
             pass
 
-        self.middleware_pipeline.reset()
+        self._middleware.reset()
         self.tool_manager.reset_all()
         self._reset_session()
 
@@ -1062,7 +717,7 @@ class Agent:
             self.messages.extend(preserved_messages)
 
         self.session_memory.clear()
-        self._memory_synced = False
+        self._conversation.mark_memory_synced(False)
         self._ensure_memory_initialized()
         if self.session_memory.entries:
             self._rebuild_messages_with_memory(self._conversation_without_memory())
@@ -1078,14 +733,9 @@ class Agent:
         except ValueError:
             pass
 
-        self._last_observed_message_index = 0
-
         self._setup_middleware(max_turns, max_price)
 
-        if self.message_observer:
-            for msg in self.messages:
-                self.message_observer(msg)
-            self._last_observed_message_index = len(self.messages)
+        self._conversation.reset_observer_view()
 
         self.tool_manager.reset_all()
 

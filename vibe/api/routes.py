@@ -41,6 +41,7 @@ from vibe.api.consumer import SSEEventConsumer
 from vibe.api.events import EventSerializer
 from vibe.core.dispatchers import EventDispatcher
 from vibe.core.runners import AgentRunner, AutoApproveHandler
+from vibe.ipc.event_bus import EventBusPublisher, default_event_bus_config
 
 if TYPE_CHECKING:
     from vibe.core.agent import Agent
@@ -96,17 +97,24 @@ def create_agent_router(
     agent: Agent | None = None
     dispatcher: EventDispatcher | None = None
     runner: AgentRunner | None = None
+    event_bus_publisher: EventBusPublisher | None = None
     active_consumers: list[SSEEventConsumer] = []
 
     async def get_or_create_agent() -> tuple[Agent, EventDispatcher, AgentRunner]:
         """Get or lazily create the agent."""
-        nonlocal agent, dispatcher, runner
+        nonlocal agent, dispatcher, runner, event_bus_publisher
 
         if agent is None:
             from vibe.core.agent import Agent
 
             agent = Agent(config, auto_approve=auto_approve)
-            dispatcher = EventDispatcher()
+            bus_config = default_event_bus_config(config.effective_workdir)
+            event_bus_publisher = EventBusPublisher(bus_config)
+            logger.info(
+                "ipc.event_bus_publisher_ready",
+                extra={"address": event_bus_publisher.address, "context": "api"},
+            )
+            dispatcher = EventDispatcher(event_bus=event_bus_publisher)
             approval_handler = AutoApproveHandler(auto_approve)
             runner = AgentRunner(agent, dispatcher, approval_handler)
 
@@ -231,6 +239,15 @@ def create_agent_router(
             summary = await runner.compact()
             return {"summary": summary}
         return {"summary": ""}
+
+    @router.on_event("shutdown")
+    async def close_event_bus() -> None:
+        if event_bus_publisher:
+            event_bus_publisher.close()
+            logger.info(
+                "ipc.event_bus_publisher_closed",
+                extra={"address": event_bus_publisher.address, "context": "api"},
+            )
 
     async def _run_agent(runner: AgentRunner, message: str) -> None:
         """Run agent and consume all events."""
