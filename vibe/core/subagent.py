@@ -26,6 +26,7 @@ from vibe.core.types import (
     LLMChunk,
     LLMMessage,
     Role,
+    SubagentProgressEvent,
     ToolCall,
     ToolCallEvent,
     ToolResultEvent,
@@ -181,6 +182,19 @@ class SubAgent:
         timeout = self.config.api_timeout
         return BACKEND_FACTORY[provider.backend](provider=provider, timeout=timeout)
 
+    def _build_progress_event(self, activity: str | None = None) -> SubagentProgressEvent:
+        """Create a progress event snapshot for the current stats."""
+        return SubagentProgressEvent(
+            step_id=self.subagent_config.step_id,
+            subagent_id=self.subagent_id,
+            prompt_tokens=self.stats.prompt_tokens,
+            completion_tokens=self.stats.completion_tokens,
+            tool_calls=self.stats.tool_calls,
+            tool_successes=self.stats.tool_successes,
+            tool_failures=self.stats.tool_failures,
+            activity=activity,
+        )
+
     async def execute(self, task_prompt: str) -> AsyncGenerator[BaseEvent, None]:
         """
         Execute the subagent task.
@@ -283,6 +297,9 @@ class SubAgent:
                 if chunk.usage:
                     self.stats.prompt_tokens += chunk.usage.prompt_tokens
                     self.stats.completion_tokens += chunk.usage.completion_tokens
+                    yield self._tag_event(
+                        self._build_progress_event(activity="Generating response")
+                    )
 
         # Build final message
         full_content = "".join(content_parts)
@@ -325,6 +342,9 @@ class SubAgent:
             tool_name = tc.function.name
             tool_call_id = tc.id
             self.stats.tool_calls += 1
+            yield self._tag_event(
+                self._build_progress_event(activity=f"Running tool `{tool_name}`")
+            )
 
             # Get tool
             try:
@@ -339,6 +359,9 @@ class SubAgent:
                     tool_call_id=tool_call_id,
                 )
                 self.stats.tool_failures += 1
+                yield self._tag_event(
+                    self._build_progress_event(activity=f"Tool `{tool_name}` unavailable")
+                )
                 continue
 
             # Parse arguments
@@ -356,6 +379,9 @@ class SubAgent:
                     tool_call_id=tool_call_id,
                 )
                 self.stats.tool_failures += 1
+                yield self._tag_event(
+                    self._build_progress_event(activity=f"Tool `{tool_name}` argument error")
+                )
                 continue
 
             # Emit tool call event
@@ -396,6 +422,9 @@ class SubAgent:
                     tool_call_id=tool_call_id,
                 )
                 self.stats.tool_successes += 1
+                yield self._tag_event(
+                    self._build_progress_event(activity=f"Tool `{tool_name}` completed")
+                )
             except (ToolError, ToolPermissionError) as exc:
                 duration = time.time() - start
                 error_msg = str(exc)
@@ -408,6 +437,9 @@ class SubAgent:
                     tool_call_id=tool_call_id,
                 )
                 self.stats.tool_failures += 1
+                yield self._tag_event(
+                    self._build_progress_event(activity=f"Tool `{tool_name}` failed")
+                )
             except Exception as exc:
                 duration = time.time() - start
                 error_msg = f"Unexpected error: {exc}"
@@ -420,6 +452,9 @@ class SubAgent:
                     tool_call_id=tool_call_id,
                 )
                 self.stats.tool_failures += 1
+                yield self._tag_event(
+                    self._build_progress_event(activity=f"Tool `{tool_name}` crashed")
+                )
 
     def _add_tool_result(
         self,

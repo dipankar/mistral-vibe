@@ -43,7 +43,6 @@ from vibe.cli.textual_ui.widgets.messages import (
     MemoryUpdateMessage,
     PlanDecisionMessage,
     PlanStartedMessage,
-    SubagentStatusMessage,
     ThinkingPlanMessage,
     UserCommandMessage,
     UserMessage,
@@ -52,6 +51,10 @@ from vibe.cli.textual_ui.widgets.mode_indicator import ModeIndicator
 from vibe.cli.textual_ui.widgets.memory_panel import MemoryPanel
 from vibe.cli.textual_ui.widgets.planner_ticker import PlannerTicker, PlannerTickerState
 from vibe.cli.textual_ui.widgets.path_display import PathDisplay
+from vibe.cli.textual_ui.widgets.subagent_activity import (
+    SubagentActivityPanel,
+    SubagentPanelEntry,
+)
 from vibe.cli.textual_ui.widgets.sidebar import Sidebar
 from vibe.cli.textual_ui.widgets.tools import ToolCallMessage, ToolResultMessage
 from vibe.cli.textual_ui.widgets.welcome import WelcomeBanner
@@ -86,11 +89,12 @@ from vibe.core.types import (
     CompactEndEvent,
     LLMMessage,
     MemoryEntryEvent,
-    PlanStartedEvent,
     PlanDecisionEvent,
-    PlanStepUpdateEvent,
+    PlanStartedEvent,
     ResumeSessionInfo,
     Role,
+    SubagentProgressEvent,
+    ToolResultEvent,
 )
 from vibe.core.utils import (
     CancellationReason,
@@ -105,6 +109,12 @@ DEFAULT_THINKING_MODE_INSTRUCTIONS = (
     "three bullet points that outline reasoning, risks, or next checks. After that, provide an "
     "'Answer' section with actionable guidance. Keep Thoughts under 100 words."
 )
+
+ACTIVE_SUBAGENT_STATUSES: set[PlanStepStatus] = {
+    PlanStepStatus.IN_PROGRESS,
+    PlanStepStatus.NEEDS_DECISION,
+    PlanStepStatus.BLOCKED,
+}
 
 class VibeApp(App):
     ENABLE_COMMAND_PALETTE = False
@@ -227,12 +237,13 @@ class VibeApp(App):
         # completes exactly at the moment the user interrupts
         self._agent_init_interrupted = False
         self._auto_scroll = True
-        self._plan_step_cards: dict[str, SubagentStatusMessage] = {}
+        self._subagent_entries: dict[str, SubagentPanelEntry] = {}
         self._plan_decision_cards: dict[str, PlanDecisionMessage] = {}
         self._current_token_state = TokenState()
         self._rate_limit_warning = False
         self._rate_limit_reset_task: asyncio.Task | None = None
         self._sidebar: Sidebar | None = None
+        self._subagent_panel: SubagentActivityPanel | None = None
 
         # Event-based signaling for responsiveness (initialized lazily)
         self._agent_idle_event: asyncio.Event | None = None
@@ -309,12 +320,73 @@ class VibeApp(App):
             return
         await self._event_dispatcher.dispatch(event)
         self._record_local_event(event)
+        self._maybe_update_sidebar_from_event(event)
+        await self._maybe_update_subagent_panel_from_event(event)
         await self._dispatch_ui_event(event)
 
     async def _handle_bus_event(self, event: BaseEvent) -> None:
         if self._should_ignore_bus_event(event):
             return
         await self._dispatch_ui_event(event, force=True)
+
+    def _maybe_update_sidebar_from_event(self, event: BaseEvent) -> None:
+        if not self._sidebar:
+            return
+        if isinstance(event, ToolResultEvent) and event.tool_name == "todo":
+            todos = self._extract_todo_entries(event)
+            if todos is not None:
+                self._sidebar.update_todos(todos)
+
+    async def _maybe_update_subagent_panel_from_event(self, event: BaseEvent) -> None:
+        if not isinstance(event, SubagentProgressEvent):
+            return
+        entry = self._subagent_entries.get(event.step_id)
+        if not entry:
+            return
+        entry.prompt_tokens = event.prompt_tokens
+        entry.completion_tokens = event.completion_tokens
+        entry.tool_calls = event.tool_calls
+        entry.tool_successes = event.tool_successes
+        entry.tool_failures = event.tool_failures
+        if event.activity:
+            entry.activity = event.activity
+        entry.subagent_id = event.subagent_id
+        await self._refresh_subagent_panel()
+
+    def _extract_todo_entries(self, event: ToolResultEvent) -> list[dict] | None:
+        result = event.result
+        if result is None:
+            return None
+
+        todos = getattr(result, "todos", None)
+        if todos is None and hasattr(result, "model_dump"):
+            try:
+                todos = result.model_dump().get("todos")
+            except Exception:
+                todos = None
+        if not todos:
+            return None
+
+        normalized: list[dict] = []
+        for item in todos:
+            if isinstance(item, dict):
+                normalized.append(
+                    {
+                        "content": item.get("content", ""),
+                        "status": str(item.get("status", "")),
+                        "active_form": item.get("active_form") or item.get("activeForm", ""),
+                    }
+                )
+                continue
+            status = getattr(item, "status", "")
+            normalized.append(
+                {
+                    "content": getattr(item, "content", ""),
+                    "status": getattr(status, "value", status),
+                    "active_form": getattr(item, "active_form", ""),
+                }
+            )
+        return normalized
 
     async def _shutdown_event_bus(self) -> None:
         await self._event_bus_adapter.stop_listener()
@@ -441,7 +513,6 @@ class VibeApp(App):
 
         # Get reference to enhanced sidebar
         self._sidebar = self.query_one(Sidebar)
-
         # Initialize UI state and consumer
         self._ui_state = UIState(self)
         self.event_handler = TextualEventConsumer(self)
@@ -650,10 +721,38 @@ class VibeApp(App):
         return "\n".join(outline_lines) or None
 
     async def _refresh_memory_panel(self) -> None:
-        if self._memory_panel and self.agent:
-            await self._memory_panel.update_entries(
-                self.agent.session_memory.entries
-            )
+        if not self.agent:
+            if self._sidebar:
+                self._sidebar.update_memory_summary([])
+            return
+
+        entries = self.agent.session_memory.entries
+        if self._memory_panel:
+            await self._memory_panel.update_entries(entries)
+        if self._sidebar:
+            self._sidebar.update_memory_summary(entries)
+
+    async def _refresh_subagent_panel(self) -> None:
+        if not self._subagent_entries:
+            if self._subagent_panel:
+                try:
+                    await self._subagent_panel.clear_entries()
+                except Exception:
+                    pass
+                try:
+                    await self._subagent_panel.remove()
+                except Exception:
+                    pass
+                self._subagent_panel = None
+            return
+
+        if not self._subagent_panel:
+            panel = SubagentActivityPanel(id="subagent-activity-panel")
+            self._subagent_panel = panel
+            await self._mount_and_scroll(panel)
+
+        entries = list(self._subagent_entries.values())
+        await self._subagent_panel.update_entries(entries)
 
     async def _memory_command(self, argument: str | None = None) -> None:
         await self._command_controller.memory_command(argument)
@@ -1296,35 +1395,34 @@ class VibeApp(App):
 
         await self._emit_decision_events(plan)
 
-    def _build_step_update_event(
-        self, plan: PlanState, step: PlanStep
-    ) -> PlanStepUpdateEvent:
-        return PlanStepUpdateEvent(
-            plan_id=plan.plan_id,
-            step_id=step.step_id,
-            title=step.title,
-            status=step.status.value.replace("_", " ").title(),
-            notes=step.notes,
-            mode=step.mode,
-        )
-
     async def _mount_or_update_step_card(
         self, plan: PlanState, step: PlanStep
     ) -> None:
-        event = self._build_step_update_event(plan, step)
-        existing = self._plan_step_cards.get(step.step_id)
-        if existing:
-            existing.update_status(event, step.owner)
+        if step.status not in ACTIVE_SUBAGENT_STATUSES:
+            removed = self._subagent_entries.pop(step.step_id, None)
+            if removed:
+                await self._refresh_subagent_panel()
             self._update_planner_ticker(plan)
             return
-        message = SubagentStatusMessage(
-            step_id=step.step_id,
-            goal=plan.goal,
-            owner=step.owner,
-            event=event,
-        )
-        self._plan_step_cards[step.step_id] = message
-        await self._mount_and_scroll(message)
+
+        entry = self._subagent_entries.get(step.step_id)
+        if entry:
+            entry.title = step.title
+            entry.owner = step.owner or entry.owner
+            entry.mode = step.mode or entry.mode
+            entry.notes = step.notes or entry.notes
+            entry.status = step.status
+        else:
+            self._subagent_entries[step.step_id] = SubagentPanelEntry(
+                step_id=step.step_id,
+                title=step.title,
+                goal=plan.goal,
+                owner=step.owner,
+                mode=step.mode,
+                status=step.status,
+                notes=step.notes,
+            )
+        await self._refresh_subagent_panel()
         self._update_planner_ticker(plan)
 
     async def _emit_decision_events(self, plan: PlanState) -> None:
@@ -1389,6 +1487,8 @@ class VibeApp(App):
     def _set_active_plan_step(self, step_id: str | None, mode: str | None) -> None:
         if self._sidebar:
             self._sidebar.set_active_step(step_id, mode)
+        if self._subagent_panel:
+            self._subagent_panel.focus_step(step_id)
 
     async def _show_status(self) -> None:
         await self._command_controller.show_status()
@@ -1599,12 +1699,8 @@ class VibeApp(App):
         await self._mount_and_scroll(widget)
 
     async def mount_to_sidebar(self, widget: Widget) -> None:
-        """Mount widget to sidebar area (ITextualApp interface)."""
-        if self._sidebar:
-            todo_area = self._sidebar.get_todo_container()
-            if todo_area:
-                await todo_area.remove_children()
-                await todo_area.mount(widget)
+        """Sidebar now shows summaries only; ignore direct mounts."""
+        return
 
     def get_loading_widget(self) -> LoadingWidget | None:
         """Get current loading widget (ITextualApp interface)."""
@@ -1771,13 +1867,17 @@ class VibeApp(App):
         copy_selection_to_clipboard(self)
 
     async def _clear_plan_cards(self) -> None:
-        for message in list(self._plan_step_cards.values()):
+        self._subagent_entries.clear()
+        if self._subagent_panel:
             try:
-                if message.parent:
-                    await message.remove()
+                await self._subagent_panel.clear_entries()
             except Exception:
                 pass
-        self._plan_step_cards.clear()
+            try:
+                await self._subagent_panel.remove()
+            except Exception:
+                pass
+            self._subagent_panel = None
 
         for message in list(self._plan_decision_cards.values()):
             try:

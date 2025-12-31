@@ -1,242 +1,160 @@
-"""Enhanced sidebar with Plan and Todo panels."""
+"""Compact sidebar summaries for todos, plans, and memory."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from textual.app import ComposeResult
-from textual.containers import Vertical, VerticalScroll
-from textual.css.query import QueryError
-from textual.message import Message
-from textual.reactive import reactive
+from textual.containers import Vertical
 from textual.widgets import Static
 
-from vibe.core.planner import PlanState, PlanStep
-from vibe.cli.textual_ui.widgets.plan_panel import PlanPanel
-from vibe.cli.textual_ui.widgets.todo_panel import TodoPanel
+from vibe.core.memory import MemoryEntry
+from vibe.core.planner import PlanState, PlanStepStatus
 
 
-class CollapsibleSection(Static):
-    """A collapsible section with header and content."""
+class SummaryCard(Static):
+    """Base card with title + simple multiline body."""
 
-    collapsed: reactive[bool] = reactive(False)
-
-    class Toggled(Message):
-        def __init__(self, section_id: str, collapsed: bool) -> None:
-            super().__init__()
-            self.section_id = section_id
-            self.collapsed = collapsed
-
-    def __init__(
-        self,
-        title: str,
-        section_id: str,
-        initial_collapsed: bool = False,
-    ) -> None:
+    def __init__(self, title: str, icon: str) -> None:
         super().__init__()
-        self.add_class("collapsible-section")
+        self.add_class("summary-card")
         self._title = title
-        self._section_id = section_id
-        self.collapsed = initial_collapsed
+        self._icon = icon
+        self._body: Static | None = None
 
     def compose(self) -> ComposeResult:
-        icon = "▶" if self.collapsed else "▼"
         yield Static(
-            f"{icon} {self._title}",
-            id=f"{self._section_id}-header",
-            classes="section-header"
+            f"{self._icon} {self._title}",
+            classes="summary-card-title",
         )
-        with Vertical(id=f"{self._section_id}-content", classes="section-content"):
-            yield from self._compose_content()
+        self._body = Static("", classes="summary-card-body", markup=False)
+        yield self._body
 
-    def _compose_content(self) -> ComposeResult:
-        """Override in subclasses to provide content."""
-        yield Static("")
-
-    def watch_collapsed(self, collapsed: bool) -> None:
-        try:
-            header = self.query_one(f"#{self._section_id}-header", Static)
-            content = self.query_one(f"#{self._section_id}-content", Vertical)
-            icon = "▶" if collapsed else "▼"
-            header.update(f"{icon} {self._title}")
-            content.display = not collapsed
-        except QueryError:
-            # Widget not yet mounted
-            pass
-
-    async def on_click(self, event) -> None:
-        # Check if header was clicked
-        try:
-            header = self.query_one(f"#{self._section_id}-header", Static)
-            # Simple check - if click is in the top area, toggle
-            if event.y <= 1:
-                self.collapsed = not self.collapsed
-                self.post_message(self.Toggled(self._section_id, self.collapsed))
-                event.stop()
-        except QueryError:
-            # Widget not yet mounted
-            pass
+    def update_lines(self, *lines: str, placeholder: str = "—") -> None:
+        if not self._body:
+            return
+        text = "\n".join(line for line in lines if line) or placeholder
+        self._body.update(text)
 
 
-class TodoSection(CollapsibleSection):
-    """Todo section in the sidebar."""
+@dataclass
+class _TodoCounts:
+    total: int = 0
+    pending: int = 0
+    in_progress: int = 0
+    completed: int = 0
 
-    def __init__(self, initial_collapsed: bool = False) -> None:
-        super().__init__("Todo", "todo", initial_collapsed)
-        self._todo_panel: TodoPanel | None = None
 
-    def _compose_content(self) -> ComposeResult:
-        yield Static("Ctrl+Shift+C copies", classes="section-tip")
-        self._todo_panel = TodoPanel()
-        yield self._todo_panel
-
-    def get_todo_container(self) -> Vertical | None:
-        """Legacy method for backwards compatibility."""
-        if self._todo_panel:
-            try:
-                return self._todo_panel.query_one("#todo-list", Vertical)
-            except QueryError:
-                return None
-        return None
-
-    def get_todo_panel(self) -> TodoPanel | None:
-        return self._todo_panel
+class TodoSummaryCard(SummaryCard):
+    def __init__(self) -> None:
+        super().__init__("Todos", "☑")
+        self.update_todos([])
 
     def update_todos(self, todos_data: list[dict]) -> None:
-        if self._todo_panel:
-            self._todo_panel.update_todos(todos_data)
+        counts = _TodoCounts(total=len(todos_data))
+        first_pending = ""
+        for todo in todos_data:
+            status = (todo.get("status") or "").lower()
+            if status in {"pending", "todo"}:
+                counts.pending += 1
+                if not first_pending:
+                    first_pending = todo.get("content", "").strip()
+            elif status in {"in_progress", "in-progress"}:
+                counts.in_progress += 1
+                if not first_pending:
+                    first_pending = (
+                        todo.get("active_form") or todo.get("content", "")
+                    ).strip()
+            elif status == "completed":
+                counts.completed += 1
 
-    def set_placeholder_visible(self, visible: bool) -> None:
-        # Now handled by TodoPanel automatically
-        pass
+        if counts.total == 0:
+            self.update_lines("No tasks yet")
+            return
+
+        summary = f"{counts.completed}/{counts.total} done · {counts.in_progress} running"
+        secondary = f"Next: {first_pending[:60]}" if first_pending else ""
+        self.update_lines(summary, secondary or f"Pending: {counts.pending}")
 
 
-class PlanSection(CollapsibleSection):
-    """Plan section in the sidebar."""
-
-    def __init__(self, initial_collapsed: bool = False) -> None:
-        super().__init__("Plan", "plan", initial_collapsed)
-        self._plan_panel: PlanPanel | None = None
-
-    def _compose_content(self) -> ComposeResult:
-        self._plan_panel = PlanPanel()
-        yield self._plan_panel
+class PlanSummaryCard(SummaryCard):
+    def __init__(self) -> None:
+        super().__init__("Planning", "🗂")
+        self.update_plan(None)
 
     def update_plan(self, plan: PlanState | None) -> None:
-        if self._plan_panel:
-            self._plan_panel.update_plan(plan)
+        if not plan:
+            self.update_lines("No active plan")
+            return
 
-    def clear_plan(self) -> None:
-        """Explicitly clear the plan panel and invalidate pending updates."""
-        if self._plan_panel:
-            self._plan_panel.clear()
+        total = len(plan.steps)
+        completed = 0
+        active = ""
+        for step in plan.steps:
+            step_status = getattr(step.status, "value", step.status)
+            if step_status == PlanStepStatus.COMPLETED.value:
+                completed += 1
+            if not active and step_status in (
+                PlanStepStatus.IN_PROGRESS.value,
+                PlanStepStatus.NEEDS_DECISION.value,
+            ):
+                active = step.title
+        goal = plan.goal[:60] if plan.goal else ""
+        decisions = sum(1 for d in plan.decisions if not d.resolved)
 
-    def update_step(self, step_id: str, step: PlanStep) -> None:
-        if self._plan_panel:
-            self._plan_panel.update_step(step_id, step)
+        status_text = getattr(plan.status, "value", str(plan.status)).lower()
+        summary = f"{completed}/{total} steps · {status_text}"
+        secondary = f"Focus: {active}" if active else f"Goal: {goal}"
+        tertiary = f"Decisions: {decisions}" if decisions else ""
+        self.update_lines(summary, secondary, tertiary)
 
-    def set_active_step(self, step_id: str | None, mode: str | None = None) -> None:
-        if self._plan_panel:
-            self._plan_panel.set_active_step(step_id, mode)
 
-    def get_plan_panel(self) -> PlanPanel | None:
-        return self._plan_panel
+class MemorySummaryCard(SummaryCard):
+    def __init__(self) -> None:
+        super().__init__("Memory", "🧠")
+        self.update_entries([])
+
+    def update_entries(self, entries: list[MemoryEntry]) -> None:
+        total = len(entries)
+        if total == 0:
+            self.update_lines("No summaries captured yet")
+            return
+        last = entries[-1]
+        snippet = (last.summary or "").strip()
+        snippet = (snippet[:80] + "…") if len(snippet) > 80 else snippet
+        tokens = getattr(last, "token_count", 0)
+        self.update_lines(f"{total} entries · last {tokens} tokens", snippet or "Latest summary pending")
 
 
 class Sidebar(Static):
-    """Enhanced sidebar with Plan and Todo panels."""
-
-    plan_collapsed: reactive[bool] = reactive(False)
-    todo_collapsed: reactive[bool] = reactive(False)
-
-    class SectionToggled(Message):
-        def __init__(self, section: str, collapsed: bool) -> None:
-            super().__init__()
-            self.section = section
-            self.collapsed = collapsed
+    """Compact sidebar with summary cards."""
 
     def __init__(self) -> None:
         super().__init__()
-        self.add_class("enhanced-sidebar")
-        self._plan_section: PlanSection | None = None
-        self._todo_section: TodoSection | None = None
+        self.add_class("summary-sidebar")
+        self._todo_card = TodoSummaryCard()
+        self._plan_card = PlanSummaryCard()
+        self._memory_card = MemorySummaryCard()
 
     def compose(self) -> ComposeResult:
-        with Vertical(classes="sidebar-container"):
-            # Plan section
-            self._plan_section = PlanSection(initial_collapsed=self.plan_collapsed)
-            yield self._plan_section
+        with Vertical(id="summary-card-stack"):
+            yield self._todo_card
+            yield self._plan_card
+            yield self._memory_card
 
-            # Separator
-            yield Static("", classes="sidebar-separator")
+    # Compatibility with legacy hooks
+    def get_todo_container(self):
+        return None
 
-            # Todo section
-            self._todo_section = TodoSection(initial_collapsed=self.todo_collapsed)
-            yield self._todo_section
-
-            # Help tips at bottom
-            yield Static("/memory · memory overlay", classes="sidebar-help")
-
-    def on_collapsible_section_toggled(self, event: CollapsibleSection.Toggled) -> None:
-        if event.section_id == "plan":
-            self.plan_collapsed = event.collapsed
-        elif event.section_id == "todo":
-            self.todo_collapsed = event.collapsed
-        self.post_message(self.SectionToggled(event.section_id, event.collapsed))
-
-    # Plan methods
     def update_plan(self, plan: PlanState | None) -> None:
-        if self._plan_section:
-            self._plan_section.update_plan(plan)
+        self._plan_card.update_plan(plan)
 
-    def clear_plan(self) -> None:
-        """Explicitly clear the plan panel and invalidate pending updates."""
-        if self._plan_section:
-            self._plan_section.clear_plan()
+    def update_todos(self, todos_data: list[dict] | None) -> None:
+        self._todo_card.update_todos(todos_data or [])
 
-    def update_step(self, step_id: str, step: PlanStep) -> None:
-        if self._plan_section:
-            self._plan_section.update_step(step_id, step)
+    def update_memory_summary(self, entries: list[MemoryEntry] | None) -> None:
+        self._memory_card.update_entries(entries or [])
 
     def set_active_step(self, step_id: str | None, mode: str | None = None) -> None:
-        if self._plan_section:
-            self._plan_section.set_active_step(step_id, mode)
-
-    def get_plan_panel(self) -> PlanPanel | None:
-        if self._plan_section:
-            return self._plan_section.get_plan_panel()
-        return None
-
-    # Todo methods
-    def get_todo_container(self) -> Vertical | None:
-        if self._todo_section:
-            return self._todo_section.get_todo_container()
-        return None
-
-    def get_todo_panel(self) -> TodoPanel | None:
-        if self._todo_section:
-            return self._todo_section.get_todo_panel()
-        return None
-
-    def update_todos(self, todos_data: list[dict]) -> None:
-        if self._todo_section:
-            self._todo_section.update_todos(todos_data)
-
-    def set_todo_placeholder_visible(self, visible: bool) -> None:
-        if self._todo_section:
-            self._todo_section.set_placeholder_visible(visible)
-
-    # Collapse methods
-    def collapse_plan(self, collapsed: bool = True) -> None:
-        if self._plan_section:
-            self._plan_section.collapsed = collapsed
-            self.plan_collapsed = collapsed
-
-    def collapse_todo(self, collapsed: bool = True) -> None:
-        if self._todo_section:
-            self._todo_section.collapsed = collapsed
-            self.todo_collapsed = collapsed
-
-    def toggle_plan(self) -> None:
-        self.collapse_plan(not self.plan_collapsed)
-
-    def toggle_todo(self) -> None:
-        self.collapse_todo(not self.todo_collapsed)
+        # Legacy no-op; summary card highlights overall plan only.
+        return

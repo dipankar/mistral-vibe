@@ -32,29 +32,27 @@ Screen {
     border: round $foreground-muted;
 }
 
-#todo-section {
+#summary-card-stack {
+    layout: vertical;
     height: 1fr;
     width: 100%;
-    layout: vertical;
 }
 
-#todo-title {
-    width: 100%;
-    color: $text-muted;
+.summary-card {
+    border: round $foreground-muted;
+    padding: 1;
+    background: $surface;
+    min-height: 5;
+}
+
+.summary-card-title {
+    color: $text;
     text-style: bold;
-    padding: 0 1 0 1;
+    margin-bottom: 1;
 }
 
-#memory-tip {
-    width: 100%;
+.summary-card-body {
     color: $text-muted;
-    padding: 0 1 1 1;
-}
-
-#copy-tip {
-    width: 100%;
-    color: $text-muted;
-    padding: 0 1 0 1;
 }
 
 #chat {
@@ -62,6 +60,47 @@ Screen {
     width: 100%;
     background: $background;
     padding: 0 2 0 2;
+}
+
+#subagent-activity-panel {
+    width: 100%;
+    background: $surface;
+    border: round $foreground-muted;
+    padding: 1;
+    margin: 0 2 1 2;
+}
+
+.subagent-panel-title {
+    color: $text;
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+#subagent-tabs {
+    width: 100%;
+    layout: horizontal;
+    margin-bottom: 1;
+}
+
+.subagent-tab {
+    margin-right: 1;
+}
+
+.subagent-tab-empty {
+    color: $text-muted;
+}
+
+.subagent-tab-active {
+    text-style: bold;
+}
+
+.subagent-tree {
+    color: $text;
+    margin-bottom: 1;
+}
+
+.subagent-footer {
+    color: $text-muted;
 }
 
 #loading-area {
@@ -77,21 +116,6 @@ Screen {
     width: 1fr;
     height: auto;
     align: left middle;
-}
-
-#todo-scroll {
-    height: 1fr;
-    width: 1fr;
-    padding: 0;
-}
-
-#todo-area {
-    min-height: 1fr;
-    width: 100%;
-    background: $surface;
-    border: round $foreground-muted;
-    padding: 0 1 1 1;
-    text-align: left;
 }
 
 /* Claude Code-style Decision Form */
@@ -305,11 +329,6 @@ Screen {
 }
 
 .memory-empty-message {
-    color: $text-muted;
-    padding: 1 0;
-}
-
-.todo-placeholder {
     color: $text-muted;
     padding: 1 0;
 }
@@ -1183,97 +1202,4 @@ ContextProgress {
     width: 100%;
     color: $text-muted;
     text-align: center;
-}
-
-/* Todo Section Styles */
-.todo-scroll {
-    height: 1fr;
-    width: 100%;
-    min-height: 5;
-}
-
-#todo-items {
-    width: 100%;
-    layout: vertical;
-}
-
-.todo-placeholder {
-    color: $text-muted;
-    padding: 1 0;
-}
-
-/* Enhanced Todo Panel Styles */
-.todo-panel {
-    width: 100%;
-    layout: vertical;
-}
-
-.todo-panel-container {
-    width: 100%;
-    layout: vertical;
-}
-
-.todo-summary {
-    width: 100%;
-    padding: 0 0 1 0;
-    color: $text;
-}
-
-.todo-filter-hint {
-    color: $text-muted;
-    padding: 0 0 1 0;
-}
-
-.todo-filter-hint:hover {
-    background: $surface-lighten-1;
-}
-
-.todo-list-scroll {
-    height: 1fr;
-    width: 100%;
-    min-height: 3;
-    max-height: 20;
-}
-
-#todo-list {
-    width: 100%;
-    layout: vertical;
-}
-
-.todo-empty {
-    color: $text-muted;
-    padding: 1 0;
-}
-
-/* Todo Item Widget Styles */
-.todo-item-widget {
-    width: 100%;
-    padding: 0 0 0 1;
-    height: auto;
-}
-
-.todo-item-widget:hover {
-    background: $surface-lighten-1;
-}
-
-.todo-item-widget.todo-completed {
-    color: $success;
-}
-
-.todo-item-widget.todo-in_progress {
-    color: $warning;
-    background: $warning 10%;
-}
-
-.todo-item-widget.todo-cancelled {
-    color: $error;
-    text-style: strike;
-}
-
-.todo-item-widget.todo-pending {
-    color: $text-muted;
-}
-
-.todo-content {
-    width: 100%;
 }

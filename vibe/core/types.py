@@ -311,6 +311,23 @@ class PlanDecisionEvent(PlanEvent):
         return self.selections[0] if self.selections else None
 
 
+class SubagentProgressEvent(BaseEvent):
+    """Event emitted while a subagent is running to report token usage."""
+
+    step_id: str
+    subagent_id: str
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    tool_calls: int = 0
+    tool_successes: int = 0
+    tool_failures: int = 0
+    activity: str | None = None
+
+    @property
+    def total_tokens(self) -> int:
+        return self.prompt_tokens + self.completion_tokens
+
+
 class PlanResourceWarningEvent(PlanEvent):
     """Event emitted when planner resources are constrained."""
 
