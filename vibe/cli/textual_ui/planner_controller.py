@@ -36,6 +36,9 @@ class PlannerCallbacks:
     set_active_step: Callable[[str | None, str | None], None]
     run_subagent: Callable[[PlanStep, str], Awaitable[SubAgentResult]]
     wait_for_agent_idle: Callable[[], Awaitable[None]]
+    record_subagent_failure: Callable[
+        [PlanState | None, PlanStep, str], Awaitable[None]
+    ]
 
 
 class PlannerController:
@@ -131,11 +134,16 @@ class PlannerController:
         return plan
 
     async def cancel_plan(self) -> None:
+        cancelled_plan: PlanState | None = None
         if self._planner_agent:
+            cancelled_plan = self._planner_agent.get_plan()
             self._planner_agent.cancel()
         self.cancel_plan_executor()
-        await self._callbacks.refresh_plan(None)
+        if cancelled_plan:
+            cancelled_plan.status = PlanRunStatus.CANCELLED
+            await self._callbacks.refresh_plan(cancelled_plan)
         await self._callbacks.clear_plan_cards()
+        await self._callbacks.refresh_plan(None)
         await self._persist_plan_state_async()
 
     async def decide(
@@ -305,17 +313,27 @@ class PlannerController:
                     f"{result.stats.total_tokens} tokens",
                 )
             else:
-                await self._update_step_status(
+                updated_step = await self._update_step_status(
                     step.step_id,
                     PlanStepStatus.BLOCKED,
                     notes=result.error or "SubAgent execution failed",
                 )
+                await self._callbacks.record_subagent_failure(
+                    planner.get_plan(),
+                    updated_step or step,
+                    result.error or "SubAgent execution failed",
+                )
         except Exception as exc:
             logger.warning("SubAgent execution failed", exc_info=exc)
-            await self._update_step_status(
+            updated_step = await self._update_step_status(
                 step.step_id,
                 PlanStepStatus.BLOCKED,
                 notes=f"Error: {exc}",
+            )
+            await self._callbacks.record_subagent_failure(
+                planner.get_plan(),
+                updated_step or step,
+                f"Error: {exc}",
             )
         finally:
             self._callbacks.set_active_step(None, None)
@@ -324,13 +342,13 @@ class PlannerController:
 
     async def _update_step_status(
         self, step_id: str, status: PlanStepStatus, notes: str | None = None
-    ) -> None:
+    ) -> PlanStep | None:
         planner = self._planner_agent
         if not planner:
-            return
+            return None
         step = planner.update_step_status(step_id, status, notes)
         if not step:
-            return
+            return None
         plan = planner.get_plan()
         await self._callbacks.refresh_plan(plan)
         if plan:
@@ -339,6 +357,7 @@ class PlannerController:
         async with condition:
             self._step_update_pending = True
             condition.notify_all()
+        return step
 
     async def _maybe_mark_plan_complete(self, plan_id: str) -> None:
         planner = self._planner_agent
@@ -399,6 +418,32 @@ class PlannerController:
         if not self._planner_agent:
             self._planner_agent = PlannerAgent(self._config)
         return self._planner_agent
+
+    async def retry_step(self, step_id: str) -> PlanState | None:
+        planner = self._planner_agent
+        if not planner:
+            return None
+        plan = planner.get_plan()
+        if not plan or plan.status not in (
+            PlanRunStatus.ACTIVE,
+            PlanRunStatus.PAUSED,
+        ):
+            return None
+        target = next((s for s in plan.steps if s.step_id == step_id), None)
+        if not target or target.status not in (
+            PlanStepStatus.BLOCKED,
+            PlanStepStatus.PENDING,
+        ):
+            return None
+        step = planner.update_step_status(step_id, PlanStepStatus.PENDING)
+        if not step:
+            return None
+        await self._callbacks.refresh_plan(plan)
+        await self._callbacks.update_step_card(plan, step)
+        await self._persist_plan_state_async()
+        if plan.status == PlanRunStatus.ACTIVE:
+            await self.start_plan_executor(plan.plan_id)
+        return plan
 
     def _planner_workspace_slug(self) -> str:
         workdir = str(self._config.effective_workdir.resolve())

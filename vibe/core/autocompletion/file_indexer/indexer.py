@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import atexit
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event, RLock
+from weakref import WeakSet
 
 from vibe.core.autocompletion.file_indexer.ignore_rules import IgnoreRules
 from vibe.core.autocompletion.file_indexer.store import (
@@ -21,8 +23,23 @@ class _RebuildTask:
     done_event: Event
 
 
+# Weak set to track all FileIndexer instances for atexit cleanup
+_indexers: WeakSet[FileIndexer] = WeakSet()
+
+
+def _shutdown_all_indexers() -> None:
+    """Shutdown all FileIndexer instances at program exit."""
+    for indexer in list(_indexers):
+        indexer.shutdown()
+
+
+# Register atexit handler (only once)
+atexit.register(_shutdown_all_indexers)
+
+
 class FileIndexer:
     def __init__(self, mass_change_threshold: int = 200) -> None:
+        _indexers.add(self)
         self._lock = RLock()  # guards _store snapshot access and watcher callbacks.
         self._stats = FileIndexStats()
         self._ignore_rules = IgnoreRules()
@@ -92,15 +109,19 @@ class FileIndexer:
         if self._shutdown:
             return
         self._shutdown = True
+        _indexers.discard(self)
         self.refresh()
         self._rebuild_executor.shutdown(wait=True)
 
     def __del__(self) -> None:
-        if not self._shutdown:
-            try:
+        # Best-effort cleanup when garbage collected
+        # Primary cleanup is handled by atexit handler
+        try:
+            if not self._shutdown:
                 self.shutdown()
-            except Exception:
-                pass
+        except Exception:
+            # Silently ignore during cleanup to avoid errors during interpreter shutdown
+            pass
 
     def _start_background_rebuild(self, root: Path) -> None:
         with self._rebuild_lock:  # one rebuild per root

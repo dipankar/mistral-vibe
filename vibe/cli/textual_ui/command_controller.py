@@ -13,7 +13,7 @@ from vibe.cli.textual_ui.widgets.messages import (
     UserCommandMessage,
 )
 from vibe.core.config import VibeConfig
-from vibe.core.planner import PlanState
+from vibe.core.planner import PlanState, PlanStepStatus
 
 if TYPE_CHECKING:
     from vibe.cli.textual_ui.app import VibeApp
@@ -152,6 +152,52 @@ class CommandController:
         if self._app._sidebar:
             self._app._sidebar.clear_plan()
         await self._app._mount_and_scroll(UserCommandMessage("Planning session cancelled."))
+
+    async def retry_plan_step(self, argument: str | None) -> None:
+        controller = self._planner
+        if not controller:
+            await self._app._mount_and_scroll(
+                UserCommandMessage("Planner controller is not available.")
+            )
+            return
+        step_id = (argument or "").strip()
+        if not step_id:
+            await self._app._mount_and_scroll(
+                UserCommandMessage("Usage: `/plan retry <step_id>`")
+            )
+            return
+        plan = controller.get_plan()
+        if not plan:
+            await self._app._mount_and_scroll(
+                UserCommandMessage("No active plan. Start one with `/plan <goal>`.")
+            )
+            return
+        target = next((step for step in plan.steps if step.step_id == step_id), None)
+        if not target:
+            await self._app._mount_and_scroll(
+                UserCommandMessage(f"Step `{step_id}` not found in the current plan.")
+            )
+            return
+        if target.status not in (PlanStepStatus.BLOCKED, PlanStepStatus.PENDING):
+            await self._app._mount_and_scroll(
+                UserCommandMessage(
+                    f"Step `{step_id}` is currently {target.status.value.lower()} "
+                    "and cannot be retried."
+                )
+            )
+            return
+        updated = await controller.retry_step(step_id)
+        if not updated:
+            await self._app._mount_and_scroll(
+                ErrorMessage(
+                    f"Unable to retry step `{step_id}`.",
+                    collapsed=self._app._ui_store.tools_collapsed,
+                )
+            )
+            return
+        await self._app._mount_and_scroll(
+            UserCommandMessage(f"Restarting plan step `{step_id}` · {target.title}")
+        )
 
     async def handle_plan_decision(self, argument: str | None) -> None:
         controller = self._planner

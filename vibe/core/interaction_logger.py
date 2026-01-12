@@ -59,10 +59,11 @@ class InteractionLogger:
         filename = f"{self.session_prefix}_{timestamp}_{self.session_id[:8]}.json"
         return self.save_dir / filename
 
-    def _get_git_commit(self) -> str | None:
+    def _run_git_command(self, *args: str) -> str | None:
+        """Run a git command and return stdout on success, None on failure."""
         try:
             result = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
+                ["git", *args],
                 capture_output=True,
                 cwd=self.workdir,
                 stdin=subprocess.DEVNULL if is_windows() else None,
@@ -75,21 +76,11 @@ class InteractionLogger:
             pass
         return None
 
+    def _get_git_commit(self) -> str | None:
+        return self._run_git_command("rev-parse", "HEAD")
+
     def _get_git_branch(self) -> str | None:
-        try:
-            result = subprocess.run(
-                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                capture_output=True,
-                cwd=self.workdir,
-                stdin=subprocess.DEVNULL if is_windows() else None,
-                text=True,
-                timeout=5.0,
-            )
-            if result.returncode == 0 and result.stdout:
-                return result.stdout.strip()
-        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
-            pass
-        return None
+        return self._run_git_command("rev-parse", "--abbrev-ref", "HEAD")
 
     def _get_username(self) -> str:
         try:

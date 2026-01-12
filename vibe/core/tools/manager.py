@@ -98,7 +98,8 @@ class ToolManager:
                 sys.modules[module_name] = module
                 try:
                     spec.loader.exec_module(module)
-                except Exception:
+                except Exception as exc:
+                    logger.debug("Failed to load tool module %s: %s", path, exc)
                     continue
 
                 for obj in vars(module).values():

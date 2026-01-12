@@ -30,6 +30,7 @@ Planning mode enables a deliberate "plan → execute" workflow in Vibe. The plan
 | `/plan cancel` | Abort planning, clean up state |
 | `/plan auto on\|off` | Toggle auto-start execution after plan generation |
 | `/plan decide <id> <choice>` | Record a decision and unblock waiting steps |
+| `/plan retry <step_id>` | Reset a blocked step to pending and re-run it |
 
 ## User Flow
 
@@ -332,6 +333,16 @@ Emit PlanCompletedEvent
 - [ ] UI integration for plan scheduler commands
 - [ ] Multi-plan workflow templates
 - [ ] Plan analytics and reporting
+
+## Handling Subagent Failures
+
+Subagents can fail for many reasons (tool crashes, invalid plans, rate limits). Vibe now keeps that failure context visible and ensures every plan finishes with a clear outcome summary.
+
+- When a step transitions to `BLOCKED`, the chat feed shows a red failure banner with the reason plus any notes from the planner.
+- The sidebar/panel keeps the step marked as blocked until you retry it or cancel the plan. Completed steps automatically clear their prior failure entries.
+- At the end of each run (completed or cancelled) the app posts a summary card that lists the final status, progress, and any outstanding blocked steps, including failure details.
+- Use `/plan retry <step_id>` to reset a blocked step back to `PENDING` and re-run the subagent. This works for steps that are currently blocked or were previously retried into a pending state.
+- If multiple steps fail in parallel, each one is tracked independently so you can review them before deciding to retry or cancel.
 
 ## Troubleshooting
 

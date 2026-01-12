@@ -22,44 +22,81 @@ Screen {
 }
 
 #sidebar {
-    width: 32;
-    min-width: 28;
-    max-width: 40;
+    width: 28;
+    min-width: 24;
+    max-width: 32;
     height: 1fr;
-    padding: 1;
-    background: $background-darken-2;
-    layout: vertical;
-    border: round $foreground-muted;
-}
-
-#summary-card-stack {
-    layout: vertical;
-    height: 1fr;
-    width: 100%;
-}
-
-.summary-card {
-    border: round $foreground-muted;
-    padding: 1;
+    padding: 0;
     background: $surface;
-    min-height: 5;
+    layout: vertical;
 }
 
-.summary-card-title {
-    color: $text;
-    text-style: bold;
-    margin-bottom: 1;
+.sidebar {
+    width: 100%;
+    height: 100%;
+    padding: 0;
+    layout: vertical;
 }
 
-.summary-card-body {
+.sidebar-item {
+    width: 100%;
+    height: auto;
+    padding: 0 1;
+    layout: horizontal;
+    margin-bottom: 0;
+}
+
+.sidebar-item-label {
+    width: 1fr;
     color: $text-muted;
+}
+
+.sidebar-item-value {
+    color: $text;
+}
+
+.sidebar-card {
+    width: 100%;
+    height: auto;
+    margin-bottom: 0;
+    padding: 0 1;
+}
+
+.sidebar-card-title {
+    color: $text-muted;
+    margin-bottom: 0;
+}
+
+.sidebar-card-body {
+    color: $text-muted;
+}
+
+/* Sidebar Help */
+.sidebar-help {
+    width: 100%;
+    layout: vertical;
+    display: none;
+    padding: 1 0 0 1;
+    border-top: solid $foreground-muted;
+    margin-top: 1;
+}
+
+.sidebar-help-title {
+    color: $text-muted;
+    text-style: bold;
+    margin-bottom: 0;
+}
+
+.sidebar-help-item {
+    color: $text-muted;
+    padding-left: 1;
 }
 
 #chat {
     height: 1fr;
     width: 100%;
     background: $background;
-    padding: 0 2 0 2;
+    padding: 0 1 0 1;
 }
 
 .subagent-activity-panel {
@@ -111,7 +148,7 @@ Screen {
     height: auto;
     width: 100%;
     background: $background;
-    padding: 1 2 0 2;
+    padding: 0 1 0 1;
     layout: horizontal;
     align: left middle;
 }
@@ -274,17 +311,15 @@ Screen {
 
 .plan-confirmation-options {
     width: 100%;
-    layout: horizontal;
-}
-
-.plan-confirmation-option + .plan-confirmation-option {
-    margin-left: 1;
+    layout: grid;
+    grid-size: 2;
+    grid-gutter: 1;
 }
 
 .plan-confirmation-option {
-    flex: 1;
-    justify-content: center;
     border: round $foreground-muted;
+    text-align: center;
+    min-width: 12;
 }
 
 .plan-confirmation-option-selected {
@@ -357,15 +392,11 @@ Screen {
 #bottom-bar {
     height: auto;
     width: 100%;
-    background: $background;
-    padding: 0 2 1 2;
+    background: $surface;
+    padding: 0 1 0 1;
     align: left middle;
     layout: horizontal;
-}
-
-.path-display {
-    max-width: 40;
-    overflow-x: hidden;
+    border-top: solid $surface-lighten-1;
 }
 
 #planner-ticker {
@@ -390,7 +421,7 @@ Screen {
     width: 100%;
     background: $background;
     padding: 0;
-    margin: 0 2 1 2;
+    margin: 0 1 1 1;
 }
 
 #completion-popup {
@@ -451,7 +482,7 @@ Markdown MarkdownFence {
 }
 
 .user-message {
-    margin-top: 1;
+    margin-top: 0;
     width: 100%;
     height: auto;
 
@@ -488,7 +519,7 @@ Markdown MarkdownFence {
 }
 
 .assistant-message {
-    margin-top: 1;
+    margin-top: 0;
     width: 100%;
     height: auto;
 }
@@ -555,7 +586,7 @@ Markdown MarkdownFence {
 .bash-output-container {
     width: 100%;
     height: auto;
-    padding: 1 2;
+    padding: 0 1;
     background: $surface;
 }
 
@@ -659,8 +690,8 @@ BlinkingMessage {
     width: 100%;
     height: auto;
     margin-top: 0;
-    margin-left: 2;
-    padding: 1 2;
+    margin-left: 1;
+    padding: 0 1;
     background: $surface;
     color: $foreground;
 
@@ -1015,206 +1046,5 @@ ContextProgress {
 }
 
 /* ============================================
-   Enhanced Sidebar Styles
+   Sidebar Styles (simplified)
    ============================================ */
-
-.enhanced-sidebar {
-    width: 100%;
-    height: 100%;
-    layout: vertical;
-}
-
-.sidebar-container {
-    width: 100%;
-    height: 100%;
-    layout: vertical;
-}
-
-.sidebar-separator {
-    height: 1;
-    width: 100%;
-    background: $foreground-muted;
-    margin: 1 0;
-}
-
-.sidebar-help {
-    color: $text-muted;
-    padding: 1 0 0 0;
-    height: auto;
-}
-
-/* Collapsible Section Styles */
-.collapsible-section {
-    width: 100%;
-    layout: vertical;
-}
-
-.section-header {
-    width: 100%;
-    color: $text;
-    text-style: bold;
-    padding: 0 0 1 0;
-    background: transparent;
-}
-
-.section-header:hover {
-    color: $primary;
-}
-
-.section-content {
-    width: 100%;
-    layout: vertical;
-}
-
-.section-tip {
-    color: $text-muted;
-    padding: 0 0 1 0;
-    height: auto;
-}
-
-/* Plan Panel Styles */
-.plan-panel {
-    width: 100%;
-    layout: vertical;
-}
-
-.plan-panel-container {
-    width: 100%;
-    layout: vertical;
-}
-
-#plan-panel-header {
-    width: 100%;
-    color: $text;
-    text-style: bold;
-    padding: 0 0 1 0;
-}
-
-#plan-content {
-    width: 100%;
-    layout: vertical;
-}
-
-.plan-goal {
-    width: 100%;
-    padding: 0 0 1 0;
-    color: $text;
-}
-
-.plan-progress {
-    width: 100%;
-    padding: 0 0 1 0;
-    color: $primary;
-}
-
-#plan-steps-scroll {
-    height: auto;
-    max-height: 15;
-    width: 100%;
-}
-
-#plan-steps-list {
-    width: 100%;
-    layout: vertical;
-}
-
-.no-plan-message {
-    color: $text-muted;
-    padding: 1 0;
-}
-
-/* Plan Step Item Styles */
-.plan-step-item {
-    width: 100%;
-    padding: 0 0 0 1;
-    height: auto;
-}
-
-.plan-step-item:hover {
-    background: $surface-lighten-1;
-}
-
-.plan-step-item.active-step {
-    background: $primary 15%;
-    border-left: solid $primary;
-}
-
-.plan-step-item.step-completed {
-    color: $success;
-}
-
-.plan-step-item.step-in_progress {
-    color: $warning;
-}
-
-.plan-step-item.step-blocked {
-    color: $error;
-}
-
-.plan-step-item.step-needs_decision {
-    color: $primary;
-}
-
-.plan-step-item.step-pending {
-    color: $text-muted;
-}
-
-/* Subagent Indicator Styles */
-.subagent-indicator {
-    width: 100%;
-    padding: 0 1;
-    background: $warning 10%;
-    border-left: solid $warning;
-    margin-bottom: 1;
-}
-
-.indicator-container {
-    width: 100%;
-    layout: vertical;
-}
-
-.indicator-progress {
-    width: 100%;
-    color: $text;
-    text-style: bold;
-}
-
-.indicator-content {
-    width: 100%;
-    color: $warning;
-}
-
-.indicator-timer {
-    width: 100%;
-    color: $warning;
-}
-
-/* Step Row Styles */
-.step-row {
-    width: 100%;
-    layout: horizontal;
-}
-
-.step-content {
-    width: 1fr;
-}
-
-.step-duration {
-    width: auto;
-    text-align: right;
-    padding-right: 1;
-}
-
-/* Execution Summary Styles */
-.execution-summary {
-    width: 100%;
-    padding: 1 0;
-    border-top: solid $foreground-muted;
-    margin-top: 1;
-}
-
-.summary-content {
-    width: 100%;
-    color: $text-muted;
-    text-align: center;
-}

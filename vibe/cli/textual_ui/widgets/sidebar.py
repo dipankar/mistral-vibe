@@ -1,4 +1,4 @@
-"""Compact sidebar summaries for todos, plans, and memory."""
+"""Compact sidebar summaries for todos, plans, and agents."""
 
 from __future__ import annotations
 
@@ -8,33 +8,91 @@ from textual.app import ComposeResult
 from textual.containers import Vertical
 from textual.widgets import Static
 
-from vibe.core.memory import MemoryEntry
 from vibe.core.planner import PlanState, PlanStepStatus
+from vibe.cli.textual_ui.widgets.subagent_activity import SubagentPanelEntry
+
+
+class SidebarItem(Static):
+    """Simple sidebar item with label on left, value on right."""
+
+    def __init__(self, label: str, value: str = "", *, icon: str = "") -> None:
+        super().__init__()
+        self.add_class("sidebar-item")
+        self._label = label
+        self._icon = icon
+        self._value = value
+        self._value_widget: Static | None = None
+
+    def compose(self) -> ComposeResult:
+        icon_part = f"{self._icon} " if self._icon else ""
+        yield Static(f"{icon_part}{self._label}", classes="sidebar-item-label")
+        self._value_widget = Static(self._value, classes="sidebar-item-value", markup=False)
+        yield self._value_widget
+
+    def update(self, value: str) -> None:
+        self._value = value
+        if self._value_widget:
+            self._value_widget.update(value)
 
 
 class SummaryCard(Static):
     """Base card with title + simple multiline body."""
 
-    def __init__(self, title: str, icon: str) -> None:
+    def __init__(self, title: str, icon: str = "") -> None:
         super().__init__()
-        self.add_class("summary-card")
+        self.add_class("sidebar-card")
         self._title = title
         self._icon = icon
         self._body: Static | None = None
 
     def compose(self) -> ComposeResult:
-        yield Static(
-            f"{self._icon} {self._title}",
-            classes="summary-card-title",
-        )
-        self._body = Static("", classes="summary-card-body", markup=False)
+        icon_part = f"{self._icon} " if self._icon else ""
+        yield Static(f"{icon_part}{self._title}", classes="sidebar-card-title")
+        self._body = Static("", classes="sidebar-card-body", markup=False)
         yield self._body
 
     def update_lines(self, *lines: str, placeholder: str = "—") -> None:
-        if not self._body:
-            return
         text = "\n".join(line for line in lines if line) or placeholder
-        self._body.update(text)
+        if self._body:
+            self._body.update(text)
+
+
+class SubagentSummaryCard(SummaryCard):
+    """Compact summary of active subagents for sidebar."""
+
+    def __init__(self) -> None:
+        super().__init__("Agents", "🤖")
+        self._active_count = 0
+        self._current_step: str | None = None
+        self._update_display()
+
+    def update_subagents(self, entries: list[SubagentPanelEntry]) -> None:
+        """Update the card with active subagent entries."""
+        self._active_count = len(entries)
+        if entries:
+            for entry in entries:
+                if entry.status.value in ("in_progress", "pending"):
+                    self._current_step = entry.title
+                    break
+            else:
+                self._current_step = entries[0].title
+        else:
+            self._current_step = None
+        self._update_display()
+
+    def _update_display(self) -> None:
+        if self._active_count == 0:
+            self.update_lines("Idle")
+        elif self._active_count == 1:
+            step = self._current_step or "Working"
+            if len(step) > 20:
+                step = step[:17] + "..."
+            self.update_lines("1 active", step)
+        else:
+            step = self._current_step or "Multiple"
+            if len(step) > 20:
+                step = step[:17] + "..."
+            self.update_lines(f"{self._active_count} active", step)
 
 
 @dataclass
@@ -69,22 +127,23 @@ class TodoSummaryCard(SummaryCard):
                 counts.completed += 1
 
         if counts.total == 0:
-            self.update_lines("No tasks yet")
+            self.update_lines("Empty")
             return
 
-        summary = f"{counts.completed}/{counts.total} done · {counts.in_progress} running"
-        secondary = f"Next: {first_pending[:60]}" if first_pending else ""
-        self.update_lines(summary, secondary or f"Pending: {counts.pending}")
+        secondary = first_pending[:25] if first_pending else f"{counts.pending} pending"
+        if len(secondary) > 25:
+            secondary = secondary[:22] + "..."
+        self.update_lines(f"{counts.completed}/{counts.total}", secondary)
 
 
 class PlanSummaryCard(SummaryCard):
     def __init__(self) -> None:
-        super().__init__("Planning", "🗂")
+        super().__init__("Plan", "📋")
         self.update_plan(None)
 
     def update_plan(self, plan: PlanState | None) -> None:
         if not plan:
-            self.update_lines("No active plan")
+            self.update_lines("None")
             return
 
         total = len(plan.steps)
@@ -99,52 +158,72 @@ class PlanSummaryCard(SummaryCard):
                 PlanStepStatus.NEEDS_DECISION.value,
             ):
                 active = step.title
-        goal = plan.goal[:60] if plan.goal else ""
-        decisions = sum(1 for d in plan.decisions if not d.resolved)
 
         status_text = getattr(plan.status, "value", str(plan.status)).lower()
-        summary = f"{completed}/{total} steps · {status_text}"
-        secondary = f"Focus: {active}" if active else f"Goal: {goal}"
-        tertiary = f"Decisions: {decisions}" if decisions else ""
-        self.update_lines(summary, secondary, tertiary)
+        goal = plan.goal or ""
+        if len(goal) > 25:
+            goal = goal[:22] + "..."
 
-
-class MemorySummaryCard(SummaryCard):
-    def __init__(self) -> None:
-        super().__init__("Memory", "🧠")
-        self.update_entries([])
-
-    def update_entries(self, entries: list[MemoryEntry]) -> None:
-        total = len(entries)
-        if total == 0:
-            self.update_lines("No summaries captured yet")
-            return
-        last = entries[-1]
-        snippet = (last.summary or "").strip()
-        snippet = (snippet[:80] + "…") if len(snippet) > 80 else snippet
-        tokens = getattr(last, "token_count", 0)
-        self.update_lines(f"{total} entries · last {tokens} tokens", snippet or "Latest summary pending")
+        secondary = active[:25] if active else goal
+        self.update_lines(f"{completed}/{total} ({status_text})", secondary)
 
 
 class Sidebar(Static):
-    """Compact sidebar with summary cards."""
+    """Compact sidebar with status items and summary cards."""
+
+    BINDINGS = [
+        ("?", "toggle_help", "Help"),
+    ]
 
     def __init__(self) -> None:
         super().__init__()
-        self.add_class("summary-sidebar")
+        self.add_class("sidebar")
+        self._tokens_item = SidebarItem("Tokens", "0%", icon="📊")
+        self._path_item = SidebarItem("Path", "", icon="📁")
         self._todo_card = TodoSummaryCard()
         self._plan_card = PlanSummaryCard()
-        self._memory_card = MemorySummaryCard()
+        self._subagent_card = SubagentSummaryCard()
+        self._show_help = False
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="summary-card-stack"):
-            yield self._todo_card
-            yield self._plan_card
-            yield self._memory_card
+        # Status items at top
+        yield self._tokens_item
+        yield self._path_item
 
-    # Compatibility with legacy hooks
-    def get_todo_container(self):
-        return None
+        # Summary cards
+        yield self._todo_card
+        yield self._plan_card
+        yield self._subagent_card
+
+        # Help section (collapsed by default)
+        self._help_section = Vertical(id="sidebar-help", classes="sidebar-help")
+        with self._help_section:
+            yield Static("Keybindings", classes="sidebar-help-title")
+            yield Static("Esc - Interrupt", classes="sidebar-help-item")
+            yield Static("Ctrl+O - Tools", classes="sidebar-help-item")
+            yield Static("Ctrl+T - Todos", classes="sidebar-help-item")
+            yield Static("Shift+Tab - Auto-approve", classes="sidebar-help-item")
+            yield Static("? - Toggle help", classes="sidebar-help-item")
+
+    def action_toggle_help(self) -> None:
+        """Toggle help section visibility."""
+        self._show_help = not self._show_help
+        self._help_section.display = self._show_help
+
+    def update_tokens(self, percentage: str) -> None:
+        """Update the tokens indicator."""
+        self._tokens_item.update(percentage)
+
+    def update_path(self, path: str) -> None:
+        """Update the path indicator."""
+        display = path.split("/")[-1] if "/" in path else path
+        if len(display) > 12:
+            display = display[:10] + ".."
+        self._path_item.update(display)
+
+    def update_subagents(self, entries: list[SubagentPanelEntry]) -> None:
+        """Update the subagent summary card."""
+        self._subagent_card.update_subagents(entries)
 
     def update_plan(self, plan: PlanState | None) -> None:
         self._plan_card.update_plan(plan)
@@ -152,9 +231,8 @@ class Sidebar(Static):
     def update_todos(self, todos_data: list[dict] | None) -> None:
         self._todo_card.update_todos(todos_data or [])
 
-    def update_memory_summary(self, entries: list[MemoryEntry] | None) -> None:
-        self._memory_card.update_entries(entries or [])
+    def get_todo_container(self):
+        return None
 
     def set_active_step(self, step_id: str | None, mode: str | None = None) -> None:
-        # Legacy no-op; summary card highlights overall plan only.
         return

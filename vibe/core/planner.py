@@ -362,6 +362,13 @@ class PlannerAgent:
                 if not decision.resolved:
                     self.resource_manager.start_decision_timeout(decision.decision_id)
 
+        except json.JSONDecodeError as exc:
+            logger.warning(
+                "Planner JSON parse error (fallback triggered): %s at position %d",
+                exc.msg,
+                exc.pos,
+            )
+            plan = self._fallback_plan(plan_id, goal, f"Invalid JSON response: {exc}")
         except Exception as exc:  # noqa: BLE001
             logger.warning("Planner fallback triggered: %s", exc)
             plan = self._fallback_plan(plan_id, goal, str(exc))

@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import subprocess
 from collections import deque
+from dataclasses import dataclass
 from enum import StrEnum, auto
 from typing import Any, Callable, ClassVar, Coroutine, assert_never
 
@@ -33,7 +34,7 @@ from vibe.cli.textual_ui.presenters import ChatInputPresenter
 from vibe.cli.textual_ui.widgets.approval_app import ApprovalApp
 from vibe.cli.textual_ui.widgets.chat_input import ChatInputContainer
 from vibe.cli.textual_ui.widgets.config_app import ConfigApp
-from vibe.cli.textual_ui.widgets.context_progress import ContextProgress, TokenState
+from vibe.cli.textual_ui.widgets.context_progress import TokenState
 from vibe.cli.textual_ui.widgets.loading import LoadingWidget
 from vibe.cli.textual_ui.widgets.messages import (
     AssistantMessage,
@@ -47,10 +48,8 @@ from vibe.cli.textual_ui.widgets.messages import (
     UserCommandMessage,
     UserMessage,
 )
-from vibe.cli.textual_ui.widgets.mode_indicator import ModeIndicator
 from vibe.cli.textual_ui.widgets.memory_panel import MemoryPanel
 from vibe.cli.textual_ui.widgets.planner_ticker import PlannerTicker, PlannerTickerState
-from vibe.cli.textual_ui.widgets.path_display import PathDisplay
 from vibe.cli.textual_ui.widgets.subagent_activity import (
     SubagentActivityPanel,
     SubagentPanelEntry,
@@ -116,6 +115,15 @@ ACTIVE_SUBAGENT_STATUSES: set[PlanStepStatus] = {
     PlanStepStatus.BLOCKED,
 }
 
+
+@dataclass(slots=True)
+class PlanFailureEntry:
+    step_id: str
+    title: str
+    mode: str | None
+    reason: str
+    notes: str | None = None
+
 class VibeApp(App):
     ENABLE_COMMAND_PALETTE = False
     CSS_PATH = "app.tcss"
@@ -169,8 +177,6 @@ class VibeApp(App):
 
         self._chat_input_container: ChatInputContainer | None = None
         self._chat_input_presenter: ChatInputPresenter | None = None
-        self._mode_indicator: ModeIndicator | None = None
-        self._context_progress: ContextProgress | None = None
         self._planner_ticker: PlannerTicker | None = None
         self._memory_panel: MemoryPanel | None = None
         self._ui_store = UIStateStore()
@@ -186,6 +192,7 @@ class VibeApp(App):
             set_active_step=self._set_active_plan_step,
             run_subagent=self._execute_step_with_subagent,
             wait_for_agent_idle=self._wait_for_agent_idle,
+            record_subagent_failure=self._record_subagent_failure,
         )
         self._planner_controller = PlannerController(
             config=self.config,
@@ -239,11 +246,14 @@ class VibeApp(App):
         self._auto_scroll = True
         self._subagent_entries: dict[str, SubagentPanelEntry] = {}
         self._plan_decision_cards: dict[str, PlanDecisionMessage] = {}
+        self._active_plan_id: str | None = None
+        self._plan_failure_log: dict[str, list[PlanFailureEntry]] = {}
+        self._last_summary_plan_id: str | None = None
         self._current_token_state = TokenState()
         self._rate_limit_warning = False
         self._rate_limit_reset_task: asyncio.Task | None = None
         self._sidebar: Sidebar | None = None
-        self._subagent_panel_slot: Vertical | None = None
+        self._subagent_panel_slot: None = None
         self._subagent_panel: SubagentActivityPanel | None = None
 
         # Event-based signaling for responsiveness (initialized lazily)
@@ -481,11 +491,8 @@ class VibeApp(App):
                         yield WelcomeBanner(self.config)
                         yield Static(id="messages")
 
-                    yield Vertical(id="subagent-panel-slot")
-
                     with Horizontal(id="loading-area"):
                         yield Static(id="loading-area-content")
-                        yield ModeIndicator(auto_approve=self.auto_approve)
 
                 with Vertical(id="sidebar"):
                     yield Sidebar()
@@ -499,13 +506,7 @@ class VibeApp(App):
                 )
 
             with Horizontal(id="bottom-bar"):
-                path_widget = PathDisplay(
-                    self.config.displayed_workdir or self.config.effective_workdir
-                )
-                path_widget.add_class("path-display")
-                yield path_widget
                 yield PlannerTicker(id="planner-ticker")
-                yield ContextProgress()
 
             yield MemoryPanel()
 
@@ -514,9 +515,14 @@ class VibeApp(App):
         # Initialize event-based signaling
         self._ensure_events()
 
-        # Get reference to enhanced sidebar and subagent slot
+        # Get reference to enhanced sidebar
         self._sidebar = self.query_one(Sidebar)
-        self._subagent_panel_slot = self.query_one("#subagent-panel-slot", Vertical)
+        # Initialize sidebar indicators
+        if self._sidebar:
+            path = self.config.displayed_workdir or self.config.effective_workdir
+            self._sidebar.update_path(str(path))
+
+        self._subagent_panel_slot = None
         self._subagent_panel = None
         # Initialize UI state and consumer
         self._ui_state = UIState(self)
@@ -524,8 +530,6 @@ class VibeApp(App):
         self._setup_event_routing()
 
         self._chat_input_container = self.query_one(ChatInputContainer)
-        self._mode_indicator = self.query_one(ModeIndicator)
-        self._context_progress = self.query_one(ContextProgress)
         self._planner_ticker = self.query_one(PlannerTicker)
         self._memory_panel = self.query_one(MemoryPanel)
         if self._chat_input_container:
@@ -590,8 +594,9 @@ class VibeApp(App):
 
     def _set_context_tokens(self, state: TokenState) -> None:
         self._current_token_state = state
-        if self._context_progress:
-            self._context_progress.tokens = state
+        if self._sidebar:
+            percentage = f"{state.current_tokens*100//state.max_tokens}%" if state.max_tokens > 0 else "0%"
+            self._sidebar.update_tokens(percentage)
         self._update_planner_ticker()
 
     def _update_planner_ticker(self, plan: PlanState | None = None) -> None:
@@ -727,35 +732,20 @@ class VibeApp(App):
 
     async def _refresh_memory_panel(self) -> None:
         if not self.agent:
-            if self._sidebar:
-                self._sidebar.update_memory_summary([])
             return
 
         entries = self.agent.session_memory.entries
         if self._memory_panel:
             await self._memory_panel.update_entries(entries)
-        if self._sidebar:
-            self._sidebar.update_memory_summary(entries)
 
     async def _refresh_subagent_panel(self) -> None:
-        if not self._subagent_entries:
-            if self._subagent_panel:
-                try:
-                    await self._subagent_panel.remove()
-                except Exception:
-                    pass
-                self._subagent_panel = None
-            return
-
-        if not self._subagent_panel:
-            if not self._subagent_panel_slot:
-                return
-            panel = SubagentActivityPanel(id="subagent-activity-panel")
-            self._subagent_panel = panel
-            await self._subagent_panel_slot.mount(panel)
-
+        # Always update sidebar with subagent info
         entries = list(self._subagent_entries.values())
-        await self._subagent_panel.update_entries(entries)
+        if self._sidebar:
+            self._sidebar.update_subagents(entries)
+
+        # Subagent panel slot is no longer used - sidebar shows all info
+        self._subagent_panel = None
 
     async def _memory_command(self, argument: str | None = None) -> None:
         await self._command_controller.memory_command(argument)
@@ -1366,6 +1356,9 @@ class VibeApp(App):
     async def _cancel_plan(self, _: str | None = None) -> None:
         await self._command_controller.cancel_plan()
 
+    async def _retry_plan_step(self, argument: str | None = None) -> None:
+        await self._command_controller.retry_plan_step(argument)
+
     def _set_planner_auto_start(self, enabled: bool, *, persist: bool = True) -> None:
         self._planner_auto_start = enabled
         if persist:
@@ -1406,6 +1399,7 @@ class VibeApp(App):
             if removed:
                 await self._refresh_subagent_panel()
             self._update_planner_ticker(plan)
+            self._remove_failure_record(plan.plan_id, step.step_id)
             return
 
         entry = self._subagent_entries.get(step.step_id)
@@ -1427,6 +1421,18 @@ class VibeApp(App):
             )
         await self._refresh_subagent_panel()
         self._update_planner_ticker(plan)
+
+    def _remove_failure_record(self, plan_id: str | None, step_id: str) -> None:
+        if not plan_id:
+            return
+        entries = self._plan_failure_log.get(plan_id)
+        if not entries:
+            return
+        filtered = [entry for entry in entries if entry.step_id != step_id]
+        if filtered:
+            self._plan_failure_log[plan_id] = filtered
+        else:
+            self._plan_failure_log.pop(plan_id, None)
 
     async def _emit_decision_events(self, plan: PlanState) -> None:
         for decision in plan.decisions:
@@ -1486,6 +1492,68 @@ class VibeApp(App):
 
     async def _planner_append_message(self, text: str) -> None:
         await self._mount_and_scroll(UserCommandMessage(text))
+
+    async def _record_subagent_failure(
+        self, plan: PlanState | None, step: PlanStep, reason: str
+    ) -> None:
+        plan_id = plan.plan_id if plan else self._active_plan_id
+        if plan_id:
+            current = [
+                entry
+                for entry in self._plan_failure_log.get(plan_id, [])
+                if entry.step_id != step.step_id
+            ]
+            current.append(
+                PlanFailureEntry(
+                    step_id=step.step_id,
+                    title=step.title,
+                    mode=step.mode,
+                    reason=reason,
+                    notes=step.notes,
+                )
+            )
+            self._plan_failure_log[plan_id] = current
+
+        lines = [f"Subagent step `{step.step_id}` blocked: {reason}"]
+        if step.notes and step.notes != reason:
+            lines.append(f"Notes: {step.notes}")
+        await self._mount_and_scroll(
+            ErrorMessage("\n".join(lines), collapsed=self._ui_store.tools_collapsed)
+        )
+
+    async def _summarize_plan_outcome(self, plan: PlanState | None) -> None:
+        if not plan:
+            return
+        failures = self._plan_failure_log.pop(plan.plan_id, [])
+        status_label = plan.status.value.replace("_", " ").title()
+        total_steps = len(plan.steps)
+        completed_steps = sum(
+            1 for step in plan.steps if step.status == PlanStepStatus.COMPLETED
+        )
+        lines = [
+            f"### Plan finished: {plan.goal}",
+            f"- Status: {status_label}",
+            f"- Progress: {completed_steps}/{total_steps} steps complete",
+        ]
+        blocked = [step for step in plan.steps if step.status == PlanStepStatus.BLOCKED]
+        if blocked:
+            blocked_list = ", ".join(f"`{step.step_id}`" for step in blocked)
+            lines.append(f"- Blocked steps: {blocked_list}")
+        elif not failures:
+            lines.append("- All steps completed successfully 🎉")
+
+        if failures:
+            lines.append("")
+            lines.append("Failure details:")
+            for failure in failures:
+                detail = failure.reason
+                if failure.notes and failure.notes != failure.reason:
+                    detail = f"{detail} · {failure.notes}"
+                lines.append(
+                    f"- `{failure.step_id}` {failure.title} ({failure.mode or 'code'}) → {detail}"
+                )
+
+        await self._mount_and_scroll(UserCommandMessage("\n".join(lines)))
 
     def _set_active_plan_step(self, step_id: str | None, mode: str | None) -> None:
         if self._sidebar:
@@ -1584,9 +1652,6 @@ class VibeApp(App):
             return
 
         self.auto_approve = not self.auto_approve
-
-        if self._mode_indicator:
-            self._mode_indicator.set_auto_approve(self.auto_approve)
 
         if self._chat_input_container:
             self._chat_input_container.set_show_warning(self.auto_approve)
@@ -1871,12 +1936,9 @@ class VibeApp(App):
 
     async def _clear_plan_cards(self) -> None:
         self._subagent_entries.clear()
-        if self._subagent_panel:
-            try:
-                await self._subagent_panel.clear_entries()
-            except Exception:
-                pass
-            self._subagent_panel.display = False
+        # Update sidebar to show no active subagents
+        if self._sidebar:
+            self._sidebar.update_subagents([])
 
         for message in list(self._plan_decision_cards.values()):
             try:
@@ -1888,13 +1950,30 @@ class VibeApp(App):
         self._update_planner_ticker(None)
 
     async def _refresh_planner_panel(self, plan: PlanState | None = None) -> None:
-        # Update sidebar plan panel
+        previous_plan_id = self._active_plan_id
+        if plan:
+            if previous_plan_id and previous_plan_id != plan.plan_id:
+                self._plan_failure_log.pop(previous_plan_id, None)
+            self._plan_failure_log.setdefault(plan.plan_id, [])
+            self._active_plan_id = plan.plan_id
+        else:
+            if previous_plan_id:
+                self._plan_failure_log.pop(previous_plan_id, None)
+            self._active_plan_id = None
+
         if self._sidebar:
             self._sidebar.update_plan(plan)
         status = plan.status if plan else PlanRunStatus.IDLE
         goal = plan.goal if plan else None
         self._ui_store.set_plan_status(status, goal)
         self._update_planner_ticker(plan)
+
+        if plan and plan.plan_id != self._last_summary_plan_id and plan.status in (
+            PlanRunStatus.COMPLETED,
+            PlanRunStatus.CANCELLED,
+        ):
+            await self._summarize_plan_outcome(plan)
+            self._last_summary_plan_id = plan.plan_id
 
     async def _wait_for_agent_idle(self, timeout: float = 60.0) -> None:
         """Wait for the agent to become idle using event-based signaling.

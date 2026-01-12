@@ -90,6 +90,12 @@ class CommandRegistry:
                 description="Cancel the active planning session",
                 handler="_cancel_plan",
             ),
+            "plan_retry": Command(
+                aliases=frozenset(["/plan retry", "/plan-retry"]),
+                description="Retry a blocked plan step by ID",
+                handler="_retry_plan_step",
+                accepts_argument=True,
+            ),
             "plan_auto": Command(
                 aliases=frozenset(["/plan auto", "/plan-auto"]),
                 description="Toggle planner auto-start mode",

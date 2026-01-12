@@ -31,45 +31,31 @@ class PlannerTicker(Static):
         super().__init__("", **kwargs)
 
     def watch_state(self, new_state: PlannerTickerState) -> None:
-        goal = new_state.goal or "Plan idle"
-        status = new_state.status.lower()
-        progress = (
-            f"{new_state.completed_steps}/{max(new_state.total_steps, 1)} done"
-            if new_state.total_steps
-            else "0/0 done"
-        )
-        plan_segment = f"{goal} · {status} · {progress}"
+        # Build a compact status line
+        parts = []
 
-        agent_segment = (
-            f"agents {new_state.active_steps} run/{new_state.pending_steps} wait"
-        )
-        decisions_segment = (
-            f"decisions {new_state.pending_decisions} pending"
-            if new_state.pending_decisions
-            else "decisions clear"
-        )
+        # Plan status and progress
+        if new_state.total_steps > 0:
+            status = new_state.status.lower() or "active"
+            progress = f"{new_state.completed_steps}/{new_state.total_steps}"
+            goal = new_state.goal
+            if goal and len(goal) > 30:
+                goal = goal[:27] + "..."
+            goal_part = f" {goal}" if goal else ""
+            parts.append(f"[{progress}]{goal_part} ({status})")
+        else:
+            parts.append("No plan")
 
-        context_segment = ""
-        if new_state.max_tokens > 0:
-            warn = " mem⚠" if new_state.memory_warning else ""
-            context_segment = (
-                f"ctx {new_state.context_percentage}% "
-                f"({new_state.context_tokens:,}/{new_state.max_tokens:,}){warn}"
-            )
+        # Pending decisions
+        if new_state.pending_decisions > 0:
+            parts.append(f"⚡ {new_state.pending_decisions} decision(s)")
 
-        thinking_segment = (
-            "thinking on" if new_state.thinking_mode else "thinking off"
-        )
-        rate_segment = "rate ⚠" if new_state.rate_limited else "rate ok"
+        # Context warning
+        if new_state.memory_warning:
+            parts.append("⚠️ memory low")
 
-        segments = [
-            plan_segment,
-            agent_segment,
-            decisions_segment,
-            context_segment,
-            thinking_segment,
-            rate_segment,
-        ]
+        # Rate limited
+        if new_state.rate_limited:
+            parts.append("⚠️ rate limited")
 
-        filtered = [segment for segment in segments if segment]
-        self.update(" · ".join(filtered))
+        self.update(" ".join(parts))
